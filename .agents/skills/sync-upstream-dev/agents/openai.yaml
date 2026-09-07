@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sync Upstream Dev"
+  short_description: "Safely sync upstream/dev into this repository dev"
+  default_prompt: "Use $sync-upstream-dev to sync upstream/dev into origin/dev safely."
