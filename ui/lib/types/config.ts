@@ -74,6 +74,7 @@ export interface AliasConfig {
 	// Replicate overrides
 	use_deployments_endpoint?: boolean;
 	use_anthropic_endpoints?: boolean;
+	use_openai_endpoints?: boolean;
 }
 
 // AzureKeyConfig matching Go's schemas.AzureKeyConfig
@@ -268,10 +269,15 @@ export interface ModelProviderKey {
 	value?: SecretVar;
 	models?: string[];
 	blacklisted_models?: string[];
+	/** RE2 patterns admitting models by name shape, alongside `models`. */
+	models_patterns?: string[];
+	/** RE2 patterns blocking models by name shape, alongside `blacklisted_models`. */
+	blacklisted_models_patterns?: string[];
 	weight: number;
 	enabled?: boolean;
 	use_for_batch_api?: boolean;
 	use_anthropic_endpoints?: boolean;
+	use_openai_endpoints?: boolean;
 	aliases?: Record<string, AliasConfig>;
 	azure_key_config?: AzureKeyConfig;
 	vertex_key_config?: VertexKeyConfig;
@@ -298,6 +304,8 @@ export const DefaultModelProviderKey: ModelProviderKey = {
 	},
 	models: [],
 	blacklisted_models: [],
+	models_patterns: [],
+	blacklisted_models_patterns: [],
 	weight: 1.0,
 	enabled: true,
 };
@@ -440,6 +448,7 @@ export interface AllowedRequests {
 export interface CustomProviderConfig {
 	base_provider_type: KnownProvider;
 	is_key_less?: boolean;
+	does_not_send_done_marker?: boolean;
 	allowed_requests?: AllowedRequests;
 	request_path_overrides?: Record<string, string>;
 }
@@ -447,6 +456,24 @@ export interface CustomProviderConfig {
 // OpenAIConfig holds OpenAI-specific provider configuration.
 export interface OpenAIConfig {
 	disable_store?: boolean;
+}
+
+// CacheControlInjectionPoint names one place to add a cache breakpoint.
+// A point must set role, index, or both; a point with neither matches nothing.
+export interface CacheControlInjectionPoint {
+	location: "message";
+	role?: "system" | "developer" | "user" | "assistant";
+	// Negative values count from the end, so -1 is the last message.
+	index?: number;
+}
+
+// PromptCacheConfig opts a provider into synthesizing cache breakpoints for requests
+// that carry none. Off by default; requests that already carry their own markers are
+// never modified.
+export interface PromptCacheConfig {
+	auto_inject?: boolean;
+	ttl?: string;
+	cache_control_injection_points?: CacheControlInjectionPoint[];
 }
 
 // ProviderConfig matching Go's lib.ProviderConfig
@@ -459,6 +486,7 @@ export interface ModelProviderConfig {
 	store_raw_request_response?: boolean;
 	custom_provider_config?: CustomProviderConfig;
 	openai_config?: OpenAIConfig;
+	prompt_cache?: PromptCacheConfig;
 	status?: "unknown" | "success" | "list_models_failed";
 	description?: string;
 }
@@ -487,6 +515,7 @@ export interface AddProviderRequest {
 	store_raw_request_response?: boolean;
 	custom_provider_config?: CustomProviderConfig;
 	openai_config?: OpenAIConfig;
+	prompt_cache?: PromptCacheConfig;
 }
 
 // UpdateProviderRequest matching Go's UpdateProviderRequest
@@ -499,6 +528,7 @@ export interface UpdateProviderRequest {
 	store_raw_request_response?: boolean;
 	custom_provider_config?: CustomProviderConfig;
 	openai_config?: OpenAIConfig;
+	prompt_cache?: PromptCacheConfig;
 }
 
 export interface CreateProviderKeyRequest extends ModelProviderKey {}
@@ -679,6 +709,8 @@ export interface CoreConfig {
 	logging_headers: string[];
 	whitelisted_routes: string[];
 	hide_deleted_virtual_keys_in_filters: boolean;
+	// Request types excluded from Logs and Dashboard reads. Logs are still stored.
+	hidden_request_types: string[];
 	routing_chain_max_depth: number;
 	header_filter_config?: GlobalHeaderFilterConfig;
 	mcp_external_client_url?: SecretVar;
@@ -728,6 +760,7 @@ export const DefaultCoreConfig: CoreConfig = {
 	logging_headers: [],
 	whitelisted_routes: [],
 	hide_deleted_virtual_keys_in_filters: false,
+	hidden_request_types: [],
 	routing_chain_max_depth: 10,
 };
 

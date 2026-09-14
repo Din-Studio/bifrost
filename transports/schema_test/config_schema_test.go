@@ -937,6 +937,82 @@ func TestSchemaMCPClientEndpointSlug(t *testing.T) {
 	})
 }
 
+func TestSchemaMCPVirtualMCPs(t *testing.T) {
+	schema := loadSchema(t)
+
+	t.Run("mcp includes virtual_mcps property", func(t *testing.T) {
+		_, found := navigateJSON(schema, "properties", "mcp", "properties", "virtual_mcps")
+		if !found {
+			t.Error("mcp is missing 'virtual_mcps' property — MCPConfig Go struct defines this field")
+		}
+	})
+
+	t.Run("virtual_mcp_config def includes endpoint_slug property", func(t *testing.T) {
+		_, found := navigateJSON(schema, "$defs", "virtual_mcp_config", "properties", "endpoint_slug")
+		if !found {
+			t.Error("$defs/virtual_mcp_config is missing 'endpoint_slug' — VirtualMCPConfig Go struct serializes this field")
+		}
+	})
+
+	t.Run("virtual_mcps entry with explicit endpoint_slug validates", func(t *testing.T) {
+		compiled := compileSchema(t)
+		config := `{
+			"mcp": {
+				"virtual_mcps": [
+					{
+						"name": "Platform Tools",
+						"endpoint_slug": "platform-tools",
+						"enabled": true,
+						"tools": [
+							{"mcp_client_name": "github", "tool_names": ["create_pull_request"]}
+						],
+						"virtual_key_ids": ["vk-1"]
+					}
+				]
+			}
+		}`
+		if err := validateConfig(t, compiled, config); err != nil {
+			t.Errorf("virtual_mcps entry should be valid, got: %v", err)
+		}
+	})
+
+	t.Run("virtual_mcps entry with non-url-safe endpoint_slug rejected", func(t *testing.T) {
+		compiled := compileSchema(t)
+		config := `{
+			"mcp": {
+				"virtual_mcps": [
+					{"name": "Bad Slug", "endpoint_slug": "Not A Slug", "tools": [{"mcp_client_id": "c1"}]}
+				]
+			}
+		}`
+		if err := validateConfig(t, compiled, config); err == nil {
+			t.Error("non-url-safe endpoint_slug must be rejected by the schema")
+		}
+	})
+
+	t.Run("virtual_mcps entry missing required name/tools rejected", func(t *testing.T) {
+		compiled := compileSchema(t)
+		config := `{"mcp": {"virtual_mcps": [{"endpoint_slug": "x"}]}}`
+		if err := validateConfig(t, compiled, config); err == nil {
+			t.Error("virtual_mcps entry without name and tools must be rejected")
+		}
+	})
+
+	t.Run("deprecated tool_groups still validates for backward compatibility", func(t *testing.T) {
+		compiled := compileSchema(t)
+		config := `{
+			"mcp": {
+				"tool_groups": [
+					{"name": "Legacy", "tools": [{"mcp_client_name": "github"}], "team_ids": ["t-1"]}
+				]
+			}
+		}`
+		if err := validateConfig(t, compiled, config); err != nil {
+			t.Errorf("deprecated tool_groups should still validate, got: %v", err)
+		}
+	})
+}
+
 func TestSchemaVKRotationCooldownBounds(t *testing.T) {
 	compiled := compileSchema(t)
 
@@ -1830,6 +1906,105 @@ func TestSchemaGithubCopilotCredentialRequired(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if err := validateConfig(t, compiled, tt.config); err == nil {
 				t.Fatal("config should be invalid")
+			}
+		})
+	}
+}
+
+// modelPatternConfigs returns one config per surface that declares model
+// pattern arrays, each carrying the given allow-pattern and block-pattern
+// entries. The schema must apply the same pattern rules on every surface.
+func modelPatternConfigs(allow, block string) map[string]string {
+	return map[string]string{
+		"virtual key provider config": fmt.Sprintf(
+			`{"governance": {"virtual_keys": [{"id": "vk-1", "name": "vk", "provider_configs": [{"provider": "openai", "allowed_models_patterns": %s, "blacklisted_models_patterns": %s}]}]}}`,
+			allow, block),
+		"provider key": fmt.Sprintf(
+			`{"providers": {"openai": {"keys": [{"name": "k", "weight": 1, "models_patterns": %s, "blacklisted_models_patterns": %s}]}}}`,
+			allow, block),
+		"access profile provider config": fmt.Sprintf(
+			`{"access_profiles": [{"name": "ap", "provider_configs": [{"provider_name": "openai", "allowed_models_patterns": %s, "blacklisted_models_patterns": %s}]}]}`,
+			allow, block),
+		"project provider config": fmt.Sprintf(
+			`{"governance": {"projects": [{"name": "p", "access_rule": "union", "provider_configs": [{"provider_name": "openai", "allowed_models_patterns": %s, "blacklisted_models_patterns": %s}]}]}}`,
+			allow, block),
+	}
+}
+
+// TestSchemaModelPatternEntries pins the pattern-list contract the field
+// descriptions state and ModelPatternList.Validate enforces at runtime: a
+// pattern is never blank, is never the "*" wildcard, and never repeats.
+func TestSchemaModelPatternEntries(t *testing.T) {
+	compiled := compileSchema(t)
+
+	tests := []struct {
+		name      string
+		allow     string
+		block     string
+		wantError bool
+	}{
+		{name: "real patterns are valid", allow: `["gpt-.*"]`, block: `["^o1-.*$", "claude-.*"]`},
+		{name: "empty lists are valid", allow: `[]`, block: `[]`},
+		{name: "a blank allow pattern is rejected", allow: `[""]`, block: `[]`, wantError: true},
+		{name: "a blank block pattern is rejected", allow: `[]`, block: `[""]`, wantError: true},
+		{name: "the wildcard is not an allow pattern", allow: `["*"]`, block: `[]`, wantError: true},
+		{name: "the wildcard is not a block pattern", allow: `[]`, block: `["*"]`, wantError: true},
+		{name: "a duplicate allow pattern is rejected", allow: `["gpt-.*", "gpt-.*"]`, block: `[]`, wantError: true},
+		{name: "a duplicate block pattern is rejected", allow: `[]`, block: `["gpt-.*", "gpt-.*"]`, wantError: true},
+	}
+
+	for _, tt := range tests {
+		for surface, config := range modelPatternConfigs(tt.allow, tt.block) {
+			t.Run(tt.name+" on the "+surface, func(t *testing.T) {
+				err := validateConfig(t, compiled, config)
+				if tt.wantError && err == nil {
+					t.Fatal("config should be invalid")
+				}
+				if !tt.wantError && err != nil {
+					t.Fatalf("config should be valid, got: %v", err)
+				}
+			})
+		}
+	}
+}
+
+// TestSchemaModelListDescriptions pins what every exact model list says about
+// its two boundary cases. The wildcard and the empty list are the whole
+// contract: reading one field's description should never leave the reader
+// guessing whether the field next to it behaves the same way.
+func TestSchemaModelListDescriptions(t *testing.T) {
+	schema := loadSchema(t)
+
+	// base_key declares no blacklisted_models: the schema has never carried the
+	// provider-key denylist that schemas.Key.BlacklistedModels serializes.
+	lists := []struct {
+		def   string
+		field string
+	}{
+		{"virtual_key_provider_config", "allowed_models"},
+		{"virtual_key_provider_config", "blacklisted_models"},
+		{"base_key", "models"},
+		{"access_profile_provider_config", "allowed_models"},
+		{"access_profile_provider_config", "blacklisted_models"},
+		{"project_provider_config", "allowed_models"},
+		{"project_provider_config", "blacklisted_models"},
+	}
+
+	for _, list := range lists {
+		t.Run(list.def+"."+list.field, func(t *testing.T) {
+			value, ok := navigateJSON(schema, "$defs", list.def, "properties", list.field, "description")
+			if !ok {
+				t.Fatalf("%s.%s has no description", list.def, list.field)
+			}
+			description, ok := value.(string)
+			if !ok {
+				t.Fatalf("%s.%s description is not a string", list.def, list.field)
+			}
+			if !strings.Contains(description, `["*"]`) {
+				t.Errorf("description does not say what [\"*\"] does: %q", description)
+			}
+			if !strings.Contains(description, "empty array") {
+				t.Errorf("description does not say what an empty array does: %q", description)
 			}
 		})
 	}

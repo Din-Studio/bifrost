@@ -429,6 +429,7 @@ export interface LLMUsage {
 	prompt_tokens: number;
 	completion_tokens: number;
 	total_tokens: number;
+	audio_seconds?: number;
 	prompt_tokens_details?: TokenDetails;
 	completion_tokens_details?: CompletionTokensDetails;
 }
@@ -723,6 +724,7 @@ export interface LogEntry {
 	list_models_output?: Model[];
 	tools?: Tool[];
 	tool_calls?: ToolCall[];
+	tool_call_names?: string[]; // Distinct function names the response called; kept on the row even when content is offloaded
 	latency?: number;
 	upstream_latency?: number; // provider socket time across all attempts, ms
 	overhead_latency?: number; // Bifrost overhead (total minus upstream), ms
@@ -778,6 +780,7 @@ export interface LogFilters {
 	routing_engine_used?: string[]; // For filtering by routing engine (routing-rule, governance, loadbalancing)
 	status?: string[];
 	stop_reasons?: string[]; // For filtering by stop reason (stop, length, content_filter, refusal, tool_calls, etc.)
+	tool_call_names?: string[]; // Requests whose response called any of these function names
 	complexity_tiers?: string[]; // For filtering by routing complexity tier (SIMPLE, MEDIUM, COMPLEX)
 	complexity_mechanisms?: string[]; // For filtering by complexity decision mechanism (semantic, llm, session, skipped)
 	session_id?: string; // Exact session ID used for key stickiness and request correlation

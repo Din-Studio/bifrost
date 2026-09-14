@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -617,6 +618,96 @@ func TestHandleProviderRequest_OCROperationNotAllowed(t *testing.T) {
 	}
 	if err.ExtraFields.OriginalModelRequested != "custom-mistral/mistral-ocr-latest" {
 		t.Fatalf("expected model to be preserved, got %q", err.ExtraFields.OriginalModelRequested)
+	}
+}
+
+// https://github.com/maximhq/bifrost/issues/6784: an OpenAI-compatible upstream that ends
+// generation on finish_reason, never sends [DONE] and then parks the connection behind SSE
+// heartbeats holds the stream open indefinitely — heartbeat bytes reset the idle timer without
+// making semantic progress. custom_provider_config.does_not_send_done_marker is the operator's
+// declaration that finish_reason is terminal for this upstream; this pins the whole path, from
+// the account config through the per-attempt context stamp to the provider's read loop.
+func TestCustomProviderDoesNotSendDoneMarkerEndsParkedStream(t *testing.T) {
+	const chunk = `data: {"id":"chatcmpl-repro","object":"chat.completion.chunk","created":1,"model":"repro-model",` +
+		`"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}` + "\n\n" +
+		`data: {"id":"chatcmpl-repro","object":"chat.completion.chunk","created":1,"model":"repro-model",` +
+		`"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl, ok := w.(http.Flusher)
+		if !ok {
+			return
+		}
+		if _, err := w.Write([]byte(chunk)); err != nil {
+			return
+		}
+		fl.Flush()
+
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				if _, err := w.Write([]byte(": ping\n\n")); err != nil {
+					return
+				}
+				fl.Flush()
+			}
+		}
+	}))
+	defer server.Close()
+
+	const customProvider = schemas.ModelProvider("custom-openai")
+	account := NewMockAccount()
+	account.AddProviderWithBaseURL(customProvider, 1, 1, server.URL)
+	account.configs[customProvider].NetworkConfig.MaxRetries = 0
+	account.SetCustomProviderConfig(customProvider, &schemas.CustomProviderConfig{
+		BaseProviderType:      schemas.OpenAI,
+		DoesNotSendDoneMarker: true,
+	})
+	account.SetKeysForProvider(customProvider, []schemas.Key{
+		{ID: "custom-key", Value: *schemas.NewSecretVar("sk-custom"), Models: schemas.WhiteList{"*"}, Weight: 100},
+	})
+
+	client := newStreamTestClient(t, account)
+	ctx, cancel := schemas.NewBifrostContextWithCancel(context.Background())
+	defer cancel()
+
+	stream, bifrostErr := client.ChatCompletionStreamRequest(ctx, &schemas.BifrostChatRequest{
+		Provider: customProvider,
+		Model:    "repro-model",
+		Input: []schemas.ChatMessage{{
+			Role:    schemas.ChatMessageRoleUser,
+			Content: &schemas.ChatMessageContent{ContentStr: Ptr("hi")},
+		}},
+	})
+	if bifrostErr != nil {
+		t.Fatalf("stream request failed: %v", bifrostErr)
+	}
+
+	type drained struct {
+		content string
+		errs    []string
+	}
+	done := make(chan drained, 1)
+	go func() {
+		content, errs := drainChatStream(stream)
+		done <- drained{content: content, errs: errs}
+	}()
+
+	select {
+	case result := <-done:
+		if len(result.errs) > 0 {
+			t.Fatalf("stream carried errors: %v", result.errs)
+		}
+		if result.content != "hello" {
+			t.Errorf("expected the streamed content to survive the early break, got %q", result.content)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("stream never terminated: does_not_send_done_marker did not reach the provider read loop")
 	}
 }
 
@@ -3014,6 +3105,44 @@ func (f *fakeRoutingPlugin) PostLLMHook(ctx *schemas.BifrostContext, resp *schem
 	return resp, bifrostErr, nil
 }
 
+type postHookResponsePreservingPlugin struct {
+	fakeRoutingPlugin
+	block                 bool
+	seenResponseWithError bool
+}
+
+func (p *postHookResponsePreservingPlugin) PostLLMHook(_ *schemas.BifrostContext, resp *schemas.BifrostResponse, bifrostErr *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError, error) {
+	if p.block {
+		statusCode := 400
+		return resp, &schemas.BifrostError{
+			StatusCode: &statusCode,
+			Error:      &schemas.ErrorField{Message: "blocked"},
+		}, nil
+	}
+	p.seenResponseWithError = resp != nil && bifrostErr != nil
+	return resp, bifrostErr, nil
+}
+
+func TestRunPostLLMHooksPreservesProviderResponseWithGuardrailError(t *testing.T) {
+	t.Parallel()
+
+	observer := &postHookResponsePreservingPlugin{fakeRoutingPlugin: fakeRoutingPlugin{name: "observer"}}
+	guardrail := &postHookResponsePreservingPlugin{fakeRoutingPlugin: fakeRoutingPlugin{name: "guardrail"}, block: true}
+	pipeline := newRoutingCommitPipeline(observer, guardrail)
+	resp := &schemas.BifrostResponse{ResponsesResponse: &schemas.BifrostResponsesResponse{Model: "gpt-4o-transcribe"}}
+
+	gotResp, gotErr := pipeline.RunPostLLMHooks(schemas.NewBifrostContext(context.Background(), schemas.NoDeadline), resp, nil, 2)
+	if gotResp != resp {
+		t.Fatalf("response = %#v, want original provider response", gotResp)
+	}
+	if gotErr == nil || gotErr.Error == nil || gotErr.Error.Message != "blocked" {
+		t.Fatalf("error = %#v, want guardrail block", gotErr)
+	}
+	if !observer.seenResponseWithError {
+		t.Fatal("downstream post-hook did not receive both the provider response and guardrail error")
+	}
+}
+
 func newRoutingCommitPipeline(plugins ...schemas.LLMPlugin) *PluginPipeline {
 	return &PluginPipeline{
 		logger:     NewDefaultLogger(schemas.LogLevelError),
@@ -3255,12 +3384,44 @@ func TestClearCtxForFallback_DropsCallerSuppliedKey(t *testing.T) {
 		t.Fatalf("RoutingPinnedAPIKeyID survived clearCtxForFallback: %q", pin)
 	}
 
+	// #6973: provider response headers belong to the provider that produced
+	// them. If a fallback attempt fails pre-flight, the previous provider's
+	// headers must not survive on the context and be forwarded with the
+	// fallback's error response.
+	ctx.SetValue(schemas.BifrostContextKeyProviderResponseHeaders, map[string]string{
+		"retry-after":                  "60",
+		"x-ratelimit-remaining-tokens": "0",
+	})
+	clearCtxForFallback(ctx)
+	if headers, ok := ctx.Value(schemas.BifrostContextKeyProviderResponseHeaders).(map[string]string); ok {
+		t.Fatalf("ProviderResponseHeaders survived clearCtxForFallback: %v", headers)
+	}
+
 	keys, _, err := bifrost.selectKeyFromProviderForModelWithPool(ctx, schemas.ChatCompletionRequest, schemas.Anthropic, "claude-opus-4-5", schemas.Anthropic)
 	if err != nil {
 		t.Fatalf("selectKeyFromProviderForModelWithPool: %v", err)
 	}
 	if len(keys) != 1 || keys[0].ID != "anthropic-configured" {
 		t.Fatalf("got %v, want the fallback provider's own key", keys)
+	}
+}
+
+func TestShouldContinueWithFallbacksHandlesIncompleteBifrostError(t *testing.T) {
+	statusCode := http.StatusServiceUnavailable
+	bifrost := &Bifrost{logger: NewDefaultLogger(schemas.LogLevelError)}
+	fallback := schemas.Fallback{Provider: schemas.Anthropic}
+	fallbackErr := &schemas.BifrostError{StatusCode: &statusCode}
+
+	if !bifrost.shouldContinueWithFallbacks(fallback, fallbackErr) {
+		t.Fatal("incomplete plugin error should allow the next fallback")
+	}
+}
+
+func TestShouldContinueWithFallbacksStopsOnNilError(t *testing.T) {
+	bifrost := &Bifrost{logger: NewDefaultLogger(schemas.LogLevelError)}
+	fallback := schemas.Fallback{Provider: schemas.Anthropic}
+	if bifrost.shouldContinueWithFallbacks(fallback, nil) {
+		t.Fatal("nil error should stop fallback processing")
 	}
 }
 
@@ -3512,5 +3673,55 @@ func TestApplyRawCaptureSignals_RunsAfterPassthroughClear(t *testing.T) {
 				t.Error("DropRawResponseFromClient = true, want false (store is off)")
 			}
 		})
+	}
+}
+
+// https://github.com/maximhq/bifrost/issues/6966: prepareFallbackRequest enumerates sub-request
+// types by hand, and the shallow copy shares any pointer it does not re-target with the
+// original request. A type it forgets therefore keeps the primary provider and model, so the
+// "fallback" attempt is routed back to the primary while RoutingInfo reports it as a fallback.
+// Deriving the cases from the schema (every sub-request that declares Fallbacks) pins every
+// fallback-capable type today and fails loudly for any type added later without an arm.
+func TestPrepareFallbackRequestRetargetsEveryFallbackCapableType(t *testing.T) {
+	account := NewMockAccount()
+	account.AddProvider(schemas.OpenAI, 1, 1)
+	account.AddProvider(schemas.Azure, 1, 1)
+	bifrost := &Bifrost{account: account, logger: NewDefaultLogger(schemas.LogLevelError)}
+	fallback := schemas.Fallback{Provider: schemas.Azure, Model: "fallback-model"}
+
+	reqType := reflect.TypeOf(schemas.BifrostRequest{})
+	cases := 0
+	for i := 0; i < reqType.NumField(); i++ {
+		field := reqType.Field(i)
+		if field.Type.Kind() != reflect.Ptr || field.Type.Elem().Kind() != reflect.Struct {
+			continue
+		}
+		if _, ok := field.Type.Elem().FieldByName("Fallbacks"); !ok {
+			continue
+		}
+		cases++
+		t.Run(field.Name, func(t *testing.T) {
+			sub := reflect.New(field.Type.Elem())
+			sub.Elem().FieldByName("Provider").SetString(string(schemas.OpenAI))
+			sub.Elem().FieldByName("Model").SetString("primary-model")
+			req := &schemas.BifrostRequest{}
+			reflect.ValueOf(req).Elem().Field(i).Set(sub)
+
+			got := bifrost.prepareFallbackRequest(req, fallback)
+			if got == nil {
+				t.Fatal("prepareFallbackRequest returned nil for a configured fallback provider")
+			}
+			provider, model, _ := got.GetRequestFields()
+			if provider != fallback.Provider || model != fallback.Model {
+				t.Errorf("fallback request targets %s/%s, want %s/%s (the attempt would be routed back to the primary)", provider, model, fallback.Provider, fallback.Model)
+			}
+			origProvider, origModel, _ := req.GetRequestFields()
+			if origProvider != schemas.OpenAI || origModel != "primary-model" {
+				t.Errorf("original request was mutated to %s/%s", origProvider, origModel)
+			}
+		})
+	}
+	if cases == 0 {
+		t.Fatal("no fallback-capable sub-request types found on BifrostRequest; the reflection walk is broken")
 	}
 }

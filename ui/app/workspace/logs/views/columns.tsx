@@ -85,6 +85,10 @@ function LogActionsMenu({ log, onDelete }: { log: LogEntry; onDelete: (log: LogE
 
 function getAssistantToolCallSummary(log?: LogEntry): string {
 	const toolCalls = log?.output_message?.tool_calls || [];
+	if (toolCalls.length === 0) {
+		// Hybrid list rows carry only the denormalized names; the full calls live in the offloaded payload.
+		return (log?.tool_call_names || []).join("\n");
+	}
 	return toolCalls
 		.map((toolCall) => {
 			const name = toolCall?.function?.name;
@@ -440,7 +444,7 @@ export const createColumns = (
 				if (latency === undefined || latency === null) {
 					return <div className="pl-4 font-mono text-xs">N/A</div>;
 				}
-				const tone = latency >= 5000 ? "bg-red-500" : latency >= 2000 ? "bg-amber-500" : "bg-emerald-500";
+				const tone = latency >= 5000 ? "bg-chart-error" : latency >= 2000 ? "bg-chart-warning" : "bg-chart-success";
 				const pct = Math.min(100, (latency / 5000) * 100);
 				return (
 					<div className="flex items-center gap-2 pl-4">

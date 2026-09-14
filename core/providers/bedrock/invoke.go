@@ -1015,11 +1015,12 @@ func (r *BedrockInvokeRequest) convertAnthropicTools() *BedrockToolConfig {
 		}
 
 		// tool_search_tool_* is a server tool for Anthropic's tool-search-tool beta,
-		// not an invocable function — and classic Bedrock can't support tool search
-		// at all (AWS restricts it to InvokeModel/InvokeModelWithResponseStream,
-		// never Converse; see ProviderFeatures[schemas.Bedrock].ToolSearch in the
-		// anthropic package). Skip it here rather than building a broken,
-		// schema-less "function" tool out of it.
+		// not an invocable function. This ingress converts an InvokeModel-shaped
+		// request into the Converse-shaped internal request, which has no slot
+		// for it; the egress side routes tool search to InvokeModel only when the
+		// neutral request carries the tool (bedrock.go, InvokeModel section).
+		// Skip it here rather than building a broken, schema-less "function"
+		// tool out of it.
 		if typeStr, ok := toolMap["type"].(string); ok && strings.HasPrefix(typeStr, "tool_search_tool_") {
 			continue
 		}
@@ -1343,8 +1344,8 @@ func toBedrockInvokeAnthropicResponse(resp *schemas.BifrostResponsesResponse, mo
 		// Reasoning content
 		if item.ResponsesReasoning != nil {
 			// Bedrock-origin reasoning lives in Content.ContentBlocks (see
-			// convertSingleBedrockMessageToBifrostMessages) — ResponsesReasoning.Summary
-			// is OpenAI Responses-API shape and is always empty for Bedrock. Fall back
+			// convertSingleBedrockMessageToBifrostMessages); the streaming path instead
+			// closes its reasoning items with a Summary. Fall back
 			// to Summary whenever ContentBlocks yields no usable reasoning block, not
 			// merely when ContentBlocks is empty — a non-empty ContentBlocks containing
 			// no reasoning-type block would otherwise silently lose the Summary data.
@@ -1370,12 +1371,21 @@ func toBedrockInvokeAnthropicResponse(resp *schemas.BifrostResponsesResponse, mo
 				}
 			}
 			if !emittedFromContentBlocks {
+				// The signature signs the first summary entry only, matching the sibling
+				// Converse converter. An unsigned thinking block is rejected on replay, so
+				// it has to travel with the text rather than being left behind here.
+				signature := reasoningSignatureForBedrock(item.ResponsesReasoning.EncryptedContent)
 				for _, summary := range item.ResponsesReasoning.Summary {
 					if summary.Text != "" {
-						result.Content = append(result.Content, BedrockInvokeMessagesContentBlock{
+						blk := BedrockInvokeMessagesContentBlock{
 							Type:     "thinking",
 							Thinking: summary.Text,
-						})
+						}
+						if signature != nil {
+							blk.Signature = *signature
+							signature = nil
+						}
+						result.Content = append(result.Content, blk)
 					}
 				}
 			}
