@@ -1,0 +1,144 @@
+---
+title: "Identity Architecture Overview"
+description: "OSS 用户体系（Casdoor SSO + SCIM + 桥接）的分层、装配决策与阶段计划。Phase 1 全部决策的单一落点。"
+icon: "id-badge"
+---
+
+本组文档是 OSS 用户体系（PRD《Bifrost OSS 用户体系与 Casdoor User Provisioning》）Phase 1 的交付物。Phase 2–4 的每一个 Must 都应能指向这里或同目录文档中的一条已写下的契约；后续文档只引用本页，不重复决策。
+
+| 文档 | 内容 |
+|---|---|
+| 本页 | 六层分工、存储 / UI / 配置 / 部署等装配决策、阶段调整、契约对照表 |
+| [auth-and-credentials](/architecture/identity/auth-and-credentials) | 认证模式、会话模型、请求凭据矩阵、VK 可读性、停用 SLA、失效面 |
+| [identity-binding-and-sync](/architecture/identity/identity-binding-and-sync) | 绑定键、Casdoor 映射、外部 SCIM 关联规则、顺序案例、同步语义状态表、来源标记、删除动作 |
+| [rbac-matrix](/architecture/identity/rbac-matrix) | 路由 → 资源.操作 全表、三个系统角色矩阵、Phase 3 seed 的唯一来源 |
+| [casdoor-bridge](/architecture/identity/casdoor-bridge) | Casdoor v4.1.0 实测形状、webhook / 扫描 / 对账可靠性契约、`identity_sync.casdoor` 字段语义、样本清单 |
+| [test-plan](/architecture/identity/test-plan) | 验收场景 `AC-*` 全表 → 测试面与命令 |
+
+## 六层分工
+
+沿用仓库既有的 `framework/oauth2` + `handlers/mcpoauth2*.go` 分层：
+
+| 层 | 职责 | 复用契约 |
+|---|---|---|
+| Framework storage（`framework/configstore`） | 既有表；本项目只为 configstore 自有表加列（`sessions.kind/user_id/role_id`、VK 的 user 绑定） | `ConfigStore.DB/ScopedDB/RunMigration`，`tables/sessions.go` 与 `tables/mcpoauth2.go` 的 token hooks |
+| Framework identity（新包 `framework/identity`） | users / roles / permissions / user_identities / user_teams / scim_* / identity_sync_* 表与迁移；登录身份解析、claim memory、同步模式与来源规则、停用、共享写入服务 | `ConfigStore.RunMigration` / `RunSingleMigration` 在同一 `*gorm.DB` 上建表；对外只暴露自己的窄接口 |
+| Casdoor adapter（`framework/identity/casdoor`） | 目录 API、webhook 信号、增量扫描、完整 inventory 对账，输出标准化目录变化 | 调用 identity 写入服务；独立于 generic OIDC RP |
+| Transport（`transports/bifrost-http`） | OIDC / SCIM / Users / RBAC 路由族、凭据校验、管理接口授权、身份写入 ctx；`lib.ConfigData` 的 `scim_config` / `identity_sync` 类型化（**Phase 1 已落地**） | `RegisterAPIRoutes`、middleware、`OAuth2IdentityResolver`、`lib/grant.go` 的 `RecordUser` / `SettleIdentity` |
+| Governance plugin | 用户 / 团队访问许可、模型权限、预算限流记账 | `InitFromStore` 注入、`ResolvePermits`、`GatherLimits`、`grant` |
+| Data access | own / team / all 行级与聚合边界（Phase 5） | `queryscope`、`ConfigStore/LogStore.ScopedDB` |
+| UI | SSO login / refresh、真实 `RbacProvider`、Users 页 | 现有 `@enterprise` 接口面、entity selector registry、导航 hooks |
+
+依赖方向是硬约束：**identity → configstore；configstore 永不 import identity；governance 通过注入而非 import 拿到用户 permit。**
+
+## 装配决策记录
+
+每条按 决策 / 备选 / 证据 三栏，格式沿用 PRD Decisions Log。
+
+### D1 存储装配：组合式 `framework/identity`
+
+| 决策 | 备选 | 证据 |
+|---|---|---|
+| 新包 `framework/identity` 拥有身份表与迁移，通过 `ConfigStore.RunMigration` + `RunSingleMigration` 在同一 DB 建表，对外暴露窄接口；configstore 自有表需要的新列走 configstore 自己的迁移；governance 在 Phase 3 改用 `InitFromStore` 注入一个装饰 `LocalGovernanceStore` 的 store | 直接扩展 `ConfigStore` 接口：编译成本低（唯一实现是 `RDBConfigStore`），但把 8 张身份表塞进已 339 方法的接口，与 `rdb.go:6173` "owner table out of package" 的既有边界相反，与上游 `dev` 合并冲突面最大 | `framework/configstore/store.go:998-1032`（`DB` / `ScopedDB` / `RunMigration`，注释写明面向 downstream-consumer 迁移）；`migrations.go:156-172`（`RunSingleMigration` 为 "downstream consumers (bifrost-enterprise, plugins)" 而设）；`rdb.go:6172-6183`（user scope 的 owner table "out of package"）；`tables/mcpoauth2.go:395-413`（`OauthUserSummary` 由 enterprise wrapper post-fetch 填充，OSS 留 nil）；`plugins/governance/main.go:258-273`（`InitFromStore`）；`framework/webhooks/dispatcher.go:19-27`（消费方声明窄接口的先例） |
+
+三条规则：
+
+1. 依赖方向 identity → configstore，反向禁止。
+2. configstore 自有表的新列（`sessions`、`virtual_keys`）走 configstore 迁移；identity 自有表走 identity 迁移，两者在同一 `*gorm.DB` 上按版本顺序执行。
+3. governance 只通过 `InitFromStore` 注入的 store 看到用户 permit；`plugins/governance` 不 import `framework/identity`。
+
+### D2 UI 交付：方案 A（在追踪的 `_fallbacks/enterprise/` 内实现真实组件）
+
+| 决策 | 备选 | 证据 |
+|---|---|---|
+| 在 `ui/app/_fallbacks/enterprise/` 内实现真实 `LoginView` / `RbacProvider` / `baseQueryWithRefresh` / `usersApi`；不改 `vite.config.mts`、不动 `.gitignore`；`IS_ENTERPRISE` 保持 false；Phase 3 把下列门控点逐个改为"服务端 `auth_type` 能力门控" | 方案 B：新 edition 目录 + 改 `vite.config.mts` 判定与别名。需要改构建与 `.gitignore`，且会把所有未实现的企业页面一起"打开" | `ui/vite.config.mts:10,38-45`（整体别名切换，无逐文件 fallback）；`clientLayout.tsx:228` 已装 `RbacProvider`；`baseApi.ts:69` 已调用 `createBaseQueryWithRefresh`；`ui/app/login/page.tsx:1` 唯一入口 import `@enterprise/components/login/loginView` |
+
+Phase 3 必须逐点核对并改为能力门控的 `IS_ENTERPRISE` 站点：
+
+| 文件 | 位置 | 现状 |
+|---|---|---|
+| `ui/lib/store/apis/baseApi.ts` | `:33`、`:82` | OAuth storage 清理；401 / refresh 分支 |
+| `ui/components/topbar.tsx` | `:147-153` | user pill / 登出 |
+| `ui/app/workspace/settings/views/securityView.tsx` | `:31-35` | auth-type 查询 |
+| `ui/hooks/useOnboardingChecklist.ts` | `:47-111` | 企业项 |
+| `ui/components/sidebar.tsx` | `:1028`、`:1060` | 导航项 |
+| `ui/app/workspace/mcp-gateway/views/mcpClientFormFields.tsx` | `:376`、`:390`、`:652` | token_exchange 等企业 auth 类型 |
+| `ui/app/workspace/mcp-gateway/views/mcpUsageGuideSheet.tsx` | `:79-282` | 用法指南分支 |
+
+验收：AC-UI-1、AC-UI-2、AC-UI-3。
+
+### D3 配置块位置：顶层 `identity_sync`
+
+| 决策 | 备选 | 证据 |
+|---|---|---|
+| 新增 OSS 自有的顶层 `identity_sync`（`additionalProperties: false`），子块 `casdoor` 放目录同步参数，`allow_insecure_issuer_for_dev` 放开发用 http issuer 开关，`link_external_id_to_issuer` 放外部 SCIM 源关联声明；`scim_config` 与 `generic_config` 字段与语义原样保留，OSS 只实现 `provider: "generic"` | 塞进 `generic_config`：`additionalProperties: false` 且污染 generic OIDC 抽象，上游扩展必冲突；`scim_config.bridge` 子块：同样改动企业版拥有的 `$defs.scim_config`，无收益 | `transports/config.schema.json` `$defs.scim_config` 与 `$defs.generic_config` 均 `additionalProperties: false`；Casdoor 原生 API 用应用 `clientId/clientSecret` 做 Basic 认证，所以目录凭据复用 `generic_config`，扩展块只需 organization、webhook secret、周期参数 |
+
+Phase 1 已落地：`transports/config.schema.json` 新增 `identity_sync` / `identity_sync_casdoor`；`transports/bifrost-http/lib/configidentity.go` 定义 `ScimConfig`、`GenericOIDCConfig`、`IdentitySyncConfig`、`CasdoorSyncConfig`；`TestConfigSchemaSync` / `TestConfigSchemaSyncTopLevel` / `TestConfigSchemaSyncScimDefs` 逐字段对照。验收：AC-CFG-5。
+
+### D4 配置生命周期分期
+
+| 阶段 | 行为 |
+|---|---|
+| Phase 1（已落地） | 只读 `config.json`；`LoadConfig` 阶段类型化并校验；密钥字段（`clientSecret`、`provisioningToken`、`webhook_secret`）为 `schemas.SecretVar`，支持 `env.` 前缀；不写 DB、不经 `/api/config` 暴露 |
+| Phase 3 | 配置变更一律 restart-required（复用 `handlers/config.go:1007-1014` `SetRestartRequiredConfig`）；`is-auth-enabled` / `/auth/type` 从 `Config.ScimConfig` 读有效模式 |
+| Phase 4 | DB 持久化、文件与 DB 优先级、向导（Should）、hot reload；API 响应必须显式调用 `SecretVar.Redacted()`——`SecretVar.MarshalJSON`（`core/schemas/secretvar.go:320`）输出明文，**不会**自动脱敏 |
+
+兼容性变化（有意为之）：`scim_config` 从"enterprise-only、静默忽略"变为"OSS 解析"。`enabled: false` 或缺省时零行为；`enabled: true` 且 `provider != "generic"` 时**启动拒绝**并提示 OSS 仅支持 generic。运营者若在 OSS 上配置了 okta / entra 等，以前会误以为生效，现在会在启动时得到明确错误。验收：AC-CFG-1、AC-CFG-2、AC-CFG-3、AC-CFG-4。
+
+### D5 HTTPS 与本地 Casdoor
+
+正式路径要求 `issuerUrl` 为 `https://`；`scim_config.trusted_networks` 只影响 SSRF 出站白名单，**不豁免** HTTPS。开发环境用 `identity_sync.allow_insecure_issuer_for_dev: true` 显式放行 `http://`，启动时 `logger.Warn` 一次。验收：AC-CFG-3。
+
+### D6 部署范围：v1 单实例
+
+| 决策 | 备选 | 证据 |
+|---|---|---|
+| v1 声明单实例；多实例的配置 / 身份 / 权限缓存失效传播与 refresh token 去重轮换留 Phase 5 | v1 支持多实例：需要 lease / leader / 原子刷新协调 | `framework/oauth2/sync.go:88-103` 的 gate 只是外部 predicate，无分布式锁；`framework/webhooks/dispatcher.go:24-26` 有可复用的 lease / fencing 模式 |
+
+验收：AC-ATTR-4 标记为 v1 不适用。
+
+### D7 阶段调整：最小用户 permit 前移到 Phase 3
+
+| 决策 | 备选 | 证据 |
+|---|---|---|
+| Phase 3 经 `InitFromStore` 注入装饰 store，`ResolvePermits` 对 user 会话与 MCP user-mode JWT 返回一条无模型限制、无预算的 permit；预算记账与精细化许可留 Phase 5 | 全部留 Phase 5；或 v1 只允许带 VK 的推理（需要先做 VK↔user 绑定表、API、UI，`virtualkey.go:253-265` 只有 Team / Customer 归属） | `plugins/governance/store.go:1264-1282` 只从 VK 解析 permit；`main.go:722-725` 已呈现身份但无 access → `access_not_found`；`permits_test.go:1230-1242` 固定了该行为。不前移则 dashboard 用户的推理请求无法放行，日志归因目标落空。PRD 决策日志"最小用户 permit 前移"一行，用户已于 2026-09-16 确认 |
+
+验收：AC-AUTH-7、AC-AUTH-8、AC-AUTH-9、AC-AUTH-10、AC-AUTH-11。
+
+### D8 认证总开关、VK 可读性、身份绑定、删除判据
+
+这四项的决策分别落在 [auth-and-credentials](/architecture/identity/auth-and-credentials)（认证模式表、VK 可读性）、[identity-binding-and-sync](/architecture/identity/identity-binding-and-sync)（绑定键、删除判据）。本页只记结论：
+
+- 有效认证模式 = password 开启 **或** SSO 配置成功；SSO 初始化失败不得降级为无认证（AC-AUTH-2、AC-AUTH-3）。
+- 非 Admin 的 `VirtualKeys.View` 只返回脱敏值；`Reveal` v1 仅 Admin（AC-AUTH-13、AC-RBAC-4）。
+- `sub == Casdoor User.Id`（UUID）是唯一跨系统键；桥接写 `external_id = User.Id`；email / name 永不作合并键（AC-BIND-1、AC-BIND-2）。
+- 目录中"不存在"以 `get-user?userId=<uuid>&owner=<org>` 返回 `data: null` 为准（AC-BRIDGE-6）。
+
+## Phase 1 实测修正
+
+Phase 1 在本机 Casdoor v4.1.0（commit `9603cdd`，2026-09-16）抓取样本时发现两处与计划假设不同，已写入 [casdoor-bridge](/architecture/identity/casdoor-bridge)：
+
+1. **webhook 的 `extendedUser`、`Record.user`、`Record.organization` 是操作者，不是受影响用户。** 受影响用户在 `Record.object`（请求体 JSON 字符串）里；`add-user` 的 object 没有 `id`。桥接主体必须从 `Record.object.owner/name` 取并回查，`isUserExtended` 对主体识别没有帮助（AC-BRIDGE-5）。
+2. **Casdoor 投递 worker 只在启动时已存在 webhook 才会启动**（`object/webhook_worker.go` `StartWebhookDeliveryWorker` 的 `HasAnyWebhooks` 门）。启动后新建的 webhook 事件永远停在 `Pending`，直到 Casdoor 重启。运维步骤必须是"先建 webhook 再重启 Casdoor"，且扫描 + inventory 路径必须能独立收敛（AC-BRIDGE-10、AC-BRIDGE-3）。
+
+## 契约对照表
+
+PRD "关键契约"每小节与复审四项 P1 的落点：
+
+| 来源 | 契约 | 落点 | 验收 |
+|---|---|---|---|
+| PRD 会话与身份模型 | admin / user 两类会话；只有 admin 路径产生 `IsLocalAdmin`；ctx 身份写入；`OAuth2IdentityResolver`；失效面；refresh token 加密 | auth-and-credentials §会话模型、§失效面 | AC-SESS-1、AC-SESS-2、AC-SESS-3、AC-DEAC-1 |
+| PRD 同步语义状态表 | Both / SCIM-only × absent / present-empty / unmatched；来源标记 | identity-binding-and-sync §同步语义状态表、§来源标记 | AC-SYNC-1、AC-SYNC-2、AC-SYNC-3、AC-SYNC-4 |
+| PRD 数据模型 | 表清单与唯一键 | identity-binding-and-sync §绑定键；本页 D1 | AC-BIND-1 |
+| PRD 路由与 API 契约 | 新 handler 路由族；canonical permissions 路径；DELETE 语义；白名单增补 | rbac-matrix；identity-binding-and-sync §三种删除动作 | AC-RBAC-1、AC-RBAC-2、AC-SCIM-1 |
+| PRD 配置生命周期 | typed config、校验、密钥、分期 | 本页 D3、D4 | AC-CFG-1 至 AC-CFG-5 |
+| PRD HTTPS 与本地 Casdoor | 正式 HTTPS；开发独立标志 | 本页 D5 | AC-CFG-3 |
+| PRD 首个管理员与角色多命中 | 无匹配拒绝；显式建立；`highestPermissionCount` | identity-binding-and-sync §角色解析 | AC-SYNC-5 |
+| PRD 停用 SLA | 分面表 | auth-and-credentials §停用 SLA | AC-DEAC-1 至 AC-DEAC-6 |
+| PRD 桥接器可靠性 | 串行 / 栅栏、持久任务、组级重算、完整 inventory、游标提交 | casdoor-bridge §可靠性契约 | AC-BRIDGE-1 至 AC-BRIDGE-9 |
+| 复审 P1 #1 用户如何发起请求 | 请求凭据矩阵六行；最小用户 permit 前移 | auth-and-credentials §请求凭据矩阵；本页 D7 | AC-AUTH-7 至 AC-AUTH-12 |
+| 复审 P1 #2 认证总开关 | 四格模式表；SSO 失败不降级 | auth-and-credentials §认证模式表 | AC-AUTH-2、AC-AUTH-3、AC-AUTH-4、AC-AUTH-5 |
+| 复审 P1 #3 VK 可读性 | View 脱敏；Reveal 仅 Admin | auth-and-credentials §VK 可读性；rbac-matrix | AC-AUTH-13、AC-RBAC-4 |
+| 复审 P1 #4 身份关联 | Casdoor 映射；外部 SCIM 关联规则；顺序案例 | identity-binding-and-sync §Casdoor 映射表、§顺序案例表 | AC-BIND-1 至 AC-BIND-6 |
+| 复审 同步、删除与 SLA 1–6 | SCIM-only 优先级；角色清空 ≠ inactive；SCIM DELETE 外部语义；SLA 分面；栅栏适用范围；manual role 来源 | auth-and-credentials、identity-binding-and-sync、casdoor-bridge 对应小节 | AC-SESS-4、AC-SYNC-6、AC-SCIM-1、AC-DEAC-2、AC-BRIDGE-8、AC-SYNC-3 |
+| 复审 OIDC 登录与协议边界 | 登录事务负向验收；SCIM 全方法 Bearer | auth-and-credentials §登录事务要求；identity-binding-and-sync | AC-AUTH-6、AC-SCIM-2 |

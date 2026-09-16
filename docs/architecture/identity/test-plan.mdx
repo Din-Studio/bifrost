@@ -1,0 +1,114 @@
+---
+title: "Identity Test Plan"
+description: "验收场景 → 测试面与命令的映射。OSS 用户体系每一条契约都引用这里的 AC-ID。"
+icon: "clipboard-check"
+---
+
+本页把 PRD《Bifrost OSS 用户体系与 Casdoor User Provisioning》的"验收场景（开发前固定）"表与复审报告的"建议固定的核心验收门槛"表合并为一张，并给每行分配稳定 ID。其它契约文档（`auth-and-credentials`、`identity-binding-and-sync`、`rbac-matrix`、`casdoor-bridge`）只引用 ID，不重复描述。
+
+ID 形如 `AC-<域>-<序号>`。域：`CFG`（Phase 1 配置）、`AUTH`、`SESS`、`BIND`、`SYNC`、`RBAC`、`DEAC`、`BRIDGE`、`SCIM`、`ATTR`、`UI`。
+
+## 测试面与命令
+
+| 测试面 | 位置 | 命令 |
+|---|---|---|
+| framework/identity 单测 | `framework/identity/**/*_test.go` | `make test-framework`（或 `cd framework && go test ./identity/...`） |
+| transport 集成 | `transports/bifrost-http/{handlers,lib}/*_test.go` | `make test-http-transport` |
+| governance | `plugins/governance/*_test.go` | `make test-governance TESTCASE=<Name>` |
+| Playwright | `tests/e2e/features/<flow>/` | `make run-e2e FLOW=<flow>` |
+| SCIM 合规脚本 | `tests/e2e/api/`（Phase 4 新增） | Phase 4 定义 |
+| 计时验收 | 手工或脚本，记录时间戳 | Phase 3/4 定义 |
+
+## 零回归门槛
+
+"现有回归全绿"只证明**旧行为未回归**，不证明新契约成立。以下文件是每个阶段合并前必须全绿的零回归门槛：
+
+- `transports/bifrost-http/handlers/middlewares_test.go`
+- `transports/bifrost-http/handlers/governance_test.go`
+- `transports/bifrost-http/handlers/mcpserver_test.go`
+- `plugins/governance/permits_test.go`
+- `transports/bifrost-http/lib/config_test.go`（`TestConfigSchemaSync*`）
+
+命令：`make test-http-transport` 与 `make test-governance`。
+
+## 验收场景表
+
+| ID | 输入 | 可观察结果 | Phase | 测试面 | 命令 |
+|---|---|---|---|---|---|
+| AC-CFG-1 | 不含 `scim_config` / `identity_sync` 的 config.json | 启动、登录、governance、MCP 行为与现在逐字节一致 | 1 | transport 集成 + governance | `make test-http-transport`、`make test-governance` |
+| AC-CFG-2 | `scim_config.enabled=true` 且 `provider` 为 okta/entra/keycloak/zitadel/google/sailpoint | `LoadConfig` 返回错误，指出 OSS 仅支持 `generic`；进程不启动 | 1 | transport 集成 | `cd transports && go test ./bifrost-http/lib/ -run TestLoadScimConfig` |
+| AC-CFG-3 | `issuerUrl` 为 `http://`，`identity_sync.allow_insecure_issuer_for_dev` 未设 / 已设；`trusted_networks` 含 127.0.0.1 | 未设 → 拒绝；已设 → 通过并 warn；`trusted_networks` 不豁免 | 1 | transport 集成 | 同上 |
+| AC-CFG-4 | `identity_sync.casdoor.enabled=true` 但 `scim_config` 未启用 / `organization` 为空 / duration 非法 / page_size 超范围 | `LoadConfig` 返回带字段路径的错误 | 1 | transport 集成 | `cd transports && go test ./bifrost-http/lib/ -run TestLoadIdentitySyncConfig` |
+| AC-CFG-5 | `scim_config`、`identity_sync` 的 Go 类型 vs `config.schema.json` | `TestConfigSchemaSync` / `TestConfigSchemaSyncTopLevel` / `TestConfigSchemaSyncScimDefs` 真实比对而非跳过 | 1 | transport 集成 | `cd transports && go test ./bifrost-http/lib/ -run 'TestConfigSchemaSync'` |
+| AC-AUTH-1 | 无 SSO 配置 | admin 账密行为与现有 session 完全一致；`AuthBypassed` 语义保留 | 3 | transport 集成 | `make test-http-transport` |
+| AC-AUTH-2 | 仅启用 SSO，password auth 关闭 | 匿名管理请求被拒绝，不进入 `middlewares.go` 的 local-admin bypass | 1 定义 / 3 实现 | transport 集成 | `make test-http-transport`（middlewares_test） |
+| AC-AUTH-3 | SSO 配置损坏或初始化失败（discovery 不可达、JWKS 失败） | 管理请求被拒绝；`is-auth-enabled` 报错；不降级为无认证 | 3 | transport 集成 | `make test-http-transport` |
+| AC-AUTH-4 | password / SSO 四种组合 | `is-auth-enabled`、`/auth/type`、登录页、登出读同一"有效模式" | 3 | transport 集成 + Playwright | `make test-http-transport`、`make run-e2e FLOW=login` |
+| AC-AUTH-5 | password 与 SSO 同时开启 | SSO 用户与 break-glass admin 分别认证；admin 账密仍能登录 | 3 | transport 集成 | `make test-http-transport` |
+| AC-AUTH-6 | 重复 callback、错 state / nonce、错 issuer / audience、过期登录事务、并发 callback | 不创建会话、不产生部分授权状态；state 一次性消费 | 3 | framework/identity 单测 + transport 集成 | `make test-framework`、`make test-http-transport` |
+| AC-AUTH-7 | 浏览器 user session，无 VK，发起推理 / MCP 请求 | 最小用户 permit 放行；无模型限制、无预算；grant 与日志 `user_id` 正确 | 3 | governance + transport 集成 | `make test-governance TESTCASE=TestResolvePermitsUserSession` |
+| AC-AUTH-8 | cookie user session + `x-bf-vk` | VK 决定 permit；user 只做归因；日志 `user_id` = 会话用户 | 3 | governance | `make test-governance TESTCASE=TestResolvePermitsCookieWithVK` |
+| AC-AUTH-9 | IdP bearer + VK（含 user A 会话 + user B 的 VK） | 按 `dual_credential_conflict_behavior`（error / prefer_vk / prefer_idp）拒绝或选择；permit、日志、MCP 上游身份一致 | 3 | governance + transport 集成 | `make test-governance PATTERN=DualCredential` |
+| AC-AUTH-10 | MCP user-mode JWT | 同一最小用户 permit 原语放行；`IsUserActive` 为 false 时拒绝 | 3 | transport 集成（mcpserver_test） | `make test-http-transport` |
+| AC-AUTH-11 | 无任何凭据 | `enforce_auth_on_inference` 开 → 401；关 → 现状放行；与改前一致 | 3 | governance | `make test-governance` |
+| AC-AUTH-12 | 仅个人 VK（SDK） | 现状放行；VK↔user 绑定落地后日志归因到绑定用户，用户停用则 VK 停用 | 3 | governance | `make test-governance` |
+| AC-AUTH-13 | 非 Admin 角色 GET VK 列表 / 详情 | 返回脱敏 `value`；`Reveal` 仅 Admin；停用后此前读到的脱敏值不可用于调用 | 3 | transport 集成 | `make test-http-transport`（governance_test） |
+| AC-SESS-1 | 普通 SSO user session | 不被标记 `IsLocalAdmin`；Viewer 调写接口服务端 403 | 3 | transport 集成 | `make test-http-transport` |
+| AC-SESS-2 | refresh token 存储与轮换：并发刷新、进程重启、旧 token 重放 | 服务端加密存储；cookie 只含不透明凭据；旧 token 重放失败 | 3 | framework/identity 单测 + transport 集成 | `make test-framework`、`make test-http-transport` |
+| AC-SESS-3 | 登出 | 服务端 session 行与 refresh token 失效；重放 cookie 401 | 3 | transport 集成 | `make test-http-transport` |
+| AC-SESS-4 | SCIM-only + refresh 返回 `invalid_grant` | 会话失效；SCIM 管理的 active / role / team 不变 | 3–4 | framework/identity 单测 + transport 集成 | `make test-framework` |
+| AC-BIND-1 | 同一 Casdoor 用户经 OIDC / SCIM / bridge 任意顺序或并发首建 | 仅一个内部 UserID；并发以唯一约束 + 重试取胜者 | 2–4 | framework/identity 单测 | `make test-framework` |
+| AC-BIND-2 | 新身份 email 与既有用户相同 | 不隐式合并、不接管既有账号；按 sub / externalId 规则新建或拒绝 | 2–4 | framework/identity 单测 | `make test-framework` |
+| AC-BIND-3 | Casdoor 改邮箱、改名、删除后同名重建 | 不串号；新 UUID → 新用户；停用作用于正确用户 | 4 | framework/identity 单测 + bridge 集成 | `make test-framework` |
+| AC-BIND-4 | 外部 SCIM 源 externalId 缺失 / 变化 | 缺失不关联；变化视为新绑定并告警 | 4 | framework/identity 单测 | `make test-framework` |
+| AC-BIND-5 | `issuerUrl` 或 `organization` 配置变更 | 视为新 source；旧绑定保留并标 orphaned；不自动迁移 | 4 | framework/identity 单测 | `make test-framework` |
+| AC-BIND-6 | 外部 SCIM 源未声明 `link_external_id_to_issuer` | OIDC 登录不与 SCIM 用户关联：Both 新建、SCIM-only 拒绝 | 4 | framework/identity 单测 | `make test-framework` |
+| AC-SYNC-1 | claim absent / present-empty / unmatched × SCIM off, Both, SCIM-only | 分别保留、撤回、拒绝；逐格符合状态表 | 2 单测 / 3 集成 | framework/identity 单测 | `make test-framework` |
+| AC-SYNC-2 | Both 与 SCIM-only 下跨通道写入 | 跨通道回收、profile 冻结、JIT gate、停用所有权符合状态表 | 2–4 | framework/identity 单测 | `make test-framework` |
+| AC-SYNC-3 | 两个组映射同一 Team，删除其中一个组 | 不误删另一个组仍授予的成员资格；manual 授予永远保留 | 2 | framework/identity 单测 | `make test-framework` |
+| AC-SYNC-4 | SCIM 授予 team → OIDC 权威撤回 → SCIM 更新其他属性 | 终态：team 保持撤回，其他属性更新 | 2 | framework/identity 单测 | `make test-framework` |
+| AC-SYNC-5 | 角色多命中 / 无匹配 / 首个管理员 | 多命中按 `highestPermissionCount`；无匹配拒绝登录；首管理员只经 break-glass 或显式映射 | 2–3 | framework/identity 单测 + transport 集成 | `make test-framework` |
+| AC-SYNC-6 | `active=true` 但角色被清空，持旧 MCP JWT 继续请求 | governance 拒绝；不能靠 `IsUserActive` 绕过 | 3–4 | transport 集成 + governance | `make test-http-transport`、`make test-governance` |
+| AC-RBAC-1 | 矩阵每一行：非授权角色调用该路由 | 服务端 403；Admin 全通过 | 3 | transport 集成 | `make test-http-transport`（rbac_test 逐行） |
+| AC-RBAC-2 | `GET /api/governance/users/me/permissions` | 返回 `{permissions: {resource: {operation: bool}}}`，与 seed 一致 | 3 | transport 集成 | `make test-http-transport` |
+| AC-RBAC-3 | Viewer 调任何 Create / Update / Delete / Reveal / Download | 403 | 3 | transport 集成 | `make test-http-transport` |
+| AC-RBAC-4 | Developer 调 `Reveal`（provider key 明文、VK 明文） | 403 | 3 | transport 集成 | `make test-http-transport` |
+| AC-RBAC-5 | Phase 3 seed 数据 vs 矩阵文档 | 种子测试逐行比对，任何差异失败 | 3 | transport 集成 | `make test-http-transport` |
+| AC-DEAC-1 | 停用用户时其已有 cookie / MCP grant / WS | 按 SLA 回收；角色降级不依赖重新登录 | 3 | transport 集成 + 计时验收 | `make test-http-transport` |
+| AC-DEAC-2 | 已认证停用写入（SCIM / bridge）后新 HTTP / MCP 请求 | ≤ 权限缓存周期（默认 5 分钟）内拒绝；单实例即时 | 3–4 | 计时验收 | 手工 |
+| AC-DEAC-3 | IdP 响应 timeout / 5xx / `invalid_grant` / inactive / not-found | 重试不停用 / 会话失效并查 active / 停用 / 按删除处理 | 3 | framework/identity 单测 | `make test-framework` |
+| AC-DEAC-4 | 停用用户绑定的 VK；共享 VK | 绑定 VK 同步停用；共享 VK 不在个人 SLA，文档明示 | 3 | governance | `make test-governance` |
+| AC-DEAC-5 | 停用后重新激活，重放原 session / refresh / MCP grant / 个人 VK | 均不复活；需重新登录 / 重新授权 / 管理员重新启用 VK | 3–4 | transport 集成 | `make test-http-transport` |
+| AC-DEAC-6 | WebSocket 长连接，用户被停用或角色变更 | ≤ 5 分钟内重验断开；或停用广播即断 | 3 | transport 集成 + 计时验收 | `make test-http-transport` |
+| AC-BRIDGE-1 | webhook 乱序、并发、重放 | 旧快照不覆盖新状态；幂等键去重；持久队列重启后恢复 | 4 | framework/identity 单测 | `make test-framework` |
+| AC-BRIDGE-2 | 关闭 webhook 后在 Casdoor 硬删除用户 / 组 | 完整 inventory 在 SLA 内收回访问；部分扫描失败不触发批量停用 | 4 | framework/identity 单测 + 计时验收 | `make test-framework` |
+| AC-BRIDGE-3 | 只跑扫描 + 对账不开 webhook | 终态与开 webhook 一致 | 4 | framework/identity 单测 | `make test-framework` |
+| AC-BRIDGE-4 | webhook 端点：错 secret、非白名单 IP、正确 secret | 401 / 403 / 202；不进 RBAC | 4 | transport 集成 | `make test-http-transport` |
+| AC-BRIDGE-5 | webhook payload 中 `extendedUser` 为操作者而非受影响用户 | 主体只从 `Record.object` 取 `owner`/`name`（及 `id`）；回查后写入；`extendedUser.id` 不作主体 | 4 | framework/identity 单测（testdata 样本） | `make test-framework` |
+| AC-BRIDGE-6 | `delete-user` 回查 `get-user` 返回 `data: null` / timeout / 5xx | null → 软停用；timeout / 5xx → 重试不停用 | 4 | framework/identity 单测 | `make test-framework` |
+| AC-BRIDGE-7 | 增量扫描批次部分失败；同一 `updatedTime` 边界 | 游标不推进；`updatedTime >= cursor` 且按 id 去重不漏不重 | 4 | framework/identity 单测 | `make test-framework` |
+| AC-BRIDGE-8 | 组事件（add/update/delete-group）与映射配置变更 | 受影响用户重算；不用用户 `updatedTime` 排序组事件 | 4 | framework/identity 单测 | `make test-framework` |
+| AC-BRIDGE-9 | 用户 `updatedTime` 为 `Z`，组为 `+08:00` | 比较前统一转 UTC；顺序判断正确 | 4 | framework/identity 单测（testdata 样本） | `make test-framework` |
+| AC-BRIDGE-10 | Casdoor 启动时无 webhook；bridge webhook 事件停在 Pending | 文档要求先建 webhook 再重启 Casdoor；扫描路径兜底 | 4 | 文档 + 计时验收 | 手工 |
+| AC-SCIM-1 | SCIM `DELETE /Users/{id}` 后 GET / list / 再次 POST | 404 / 隐藏 / 新内部 ID（默认）；底层保留用于日志关联 | 4 | transport 集成 + SCIM 合规脚本 | `make test-http-transport` |
+| AC-SCIM-2 | 无 / 错 Bearer 调 Users、Groups 任何方法；发现端点 | 401；发现端点按本项目策略公开 | 4 | transport 集成 | `make test-http-transport` |
+| AC-SCIM-3 | 不支持的 filter；`userName eq` / `externalId eq`；PATCH；分页 | RFC 7644 错误；过滤正确；PATCH 原子；分页正确 | 4 | SCIM 合规脚本 | Phase 4 定义 |
+| AC-SCIM-4 | 至少一个非 Casdoor IdP（如 Okta / Entra 试用租户）推 Users / Groups | 连通并 provisioning 成功 | 4 | 手工互操作 | 手工 |
+| AC-SCIM-5 | SCIM 写入任一 Group / User | 从全部持久化 SCIM 状态 + 用户属性重算角色与 team | 4 | framework/identity 单测 | `make test-framework` |
+| AC-ATTR-1 | SSO 用户发推理与 MCP 请求 | `user_id` 在 grant、日志、成本聚合一致；共享 VK 无法恢复自然人身份 | 3 | transport 集成 + plugins/logging | `make test-http-transport`、`make test-plugins` |
+| AC-ATTR-2 | own / team / all 与聚合过滤 / 维度 | 不跨边界读取原始日志或经聚合推断越权数据 | 5 | transport 集成 | Phase 5 定义 |
+| AC-ATTR-3 | 直接 user limit + Team / VK limit 组合 | 许可、限制组合与记账正确；fallback / 重试不重复计费 | 5 | governance | Phase 5 定义 |
+| AC-ATTR-4 | 两个服务节点 | **v1 声明单实例，不适用**；Phase 5 增加失效传播后再验收 | 5 | 双节点测试 | Phase 5 定义 |
+| AC-UI-1 | `cd ui && npm run build` | 构建通过；`IS_ENTERPRISE` 保持 false | 3 | UI build | `cd ui && npm run build` |
+| AC-UI-2 | SSO callback / refresh、RBAC 导航、Users 页、用户 / 组 API 合约 | Playwright 通过 | 3 | Playwright | `make run-e2e FLOW=users` |
+| AC-UI-3 | `IS_ENTERPRISE` 门控点改为能力门控 | 未实现企业页面（Access Profiles 等）在 OSS 仍隐藏；Users 页可见 | 3 | Playwright | `make run-e2e FLOW=users` |
+
+## 追溯校验
+
+契约文档中出现的每个 `AC-` ID 都必须在本表存在。校验命令：
+
+```bash
+for id in $(grep -ohE 'AC-[A-Z]+-[0-9]+' docs/architecture/identity/{auth-and-credentials,identity-binding-and-sync,rbac-matrix,casdoor-bridge,overview}.mdx | sort -u); do
+  grep -q "$id" docs/architecture/identity/test-plan.mdx || echo MISSING $id
+done
+```

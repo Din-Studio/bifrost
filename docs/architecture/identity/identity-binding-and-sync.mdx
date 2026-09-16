@@ -1,0 +1,117 @@
+---
+title: "Identity Binding & Sync Semantics"
+description: "OIDC / SCIM / Casdoor 桥接三路身份如何绑定到同一内部 UserID，同步模式状态表、来源标记、角色解析与三种删除动作。每条契约引用 test-plan.mdx 的 AC-ID。"
+icon: "link"
+---
+
+本页回答复审 P1 #4：两个各自唯一的键（`issuer+sub`、`source+externalId`）只能各自防重，不能证明是同一人。下面把"什么时候算同一人"写死，并固定 Both / SCIM-only 的同步语义。验收 ID 见 [Test Plan](/architecture/identity/test-plan)。
+
+## 1. 绑定键
+
+| 表 / 约束 | 键 | 语义 | AC |
+|---|---|---|---|
+| `user_identities` | `(provider_kind, issuer, subject)` 唯一 → `user_id` | OIDC 主体。只有 `iss + sub` 受 OIDC Core §5.7 稳定性保证 | AC-BIND-1 |
+| `user_identities` | `(source_id, external_id)` 唯一 → `user_id` | SCIM / 桥接来源的外部标识；`source_id` 指向一条受信来源记录（issuer、organization、类型） | AC-BIND-1 |
+| 并发首建 | 上述唯一约束 + 冲突重试 | 两路同时首建时，唯一约束决定胜者，败者重试读取胜者的 `user_id` | AC-BIND-1 |
+| email / name / displayName | **永不作合并键** | 凭 email 合并会让新账号接管既有高权限账号；LiteLLM 的 email 合并策略不采纳 | AC-BIND-2 |
+
+## 2. Casdoor 映射表（v4.1.0，commit `9603cdd`）
+
+| Casdoor 字段 | Bifrost 用法 | 证据 | AC |
+|---|---|---|---|
+| `User.Id`（UUID） | OIDC `sub`。四种 `tokenFormat` 一致 | Casdoor `object/token_jwt.go:531-550,583-614` | AC-BIND-1 |
+| `User.Id` | 桥接写入 `external_id = User.Id` | 本地实测 `get-user` 返回 `id` 为 UUID | AC-BIND-1 |
+| `issuerUrl` + `organization` | `source = casdoor:<issuerUrl>/<organization>` | `identity_sync.casdoor.organization` | AC-BIND-5 |
+| 桥接来源 ↔ 同 issuer 的 OIDC 身份 | **键相等即同人**：`external_id == sub`，无需 email，无需 `link_external_id_to_issuer` | 两者都是 `User.Id` | AC-BIND-1 |
+| `owner` / `name` | 只作查询参数（`get-user?id=owner/name`），**永不作键**：用户可改名（`object/user.go:840-845`） | `id` 是独立 UUID 列，改名路径不触碰它；`get-user` 同时支持 `id=owner/name` 与 `userId=<uuid>&owner=` 两种查询 | AC-BIND-3 |
+| `User.externalId` | **不是桥接键**。本地真实用户上该字段是第三方登录写入的 `<provider>:<uuid>` 形式，或为空 | 样本 `framework/identity/casdoor/testdata/user.json` | AC-BIND-4 |
+| SCIM resource `id` | Bifrost 内部 `UserID` | 与 `docs/openapi/paths/management/users.yaml` 对齐 | AC-SCIM-1 |
+| `isDeleted` / `isForbidden` | `isForbidden=true` 或 `isDeleted=true` → `active=false` | 本地两组织 `enableSoftDeletion=false`，即硬删除 | AC-BRIDGE-6 |
+
+## 3. 外部 SCIM 源的关联规则
+
+SCIM `externalId` 由 provisioning client 提供，是可选、可修改、按 provisioning domain 限定的属性（RFC 7643 §3.1），不是服务端必然拥有的不可变主键。因此：
+
+| 情况 | 行为 | AC |
+|---|---|---|
+| `identity_sync.link_external_id_to_issuer` 未声明 | `externalId` 永不用于关联 OIDC 身份。OIDC 登录无绑定 → Both / JIT 新建，SCIM-only 拒绝 | AC-BIND-6 |
+| 已声明为某 issuer | 仅当 `externalId == sub` 且 OIDC 身份来自该 issuer 时关联为同一人 | AC-BIND-6 |
+| `externalId` 缺值 | 不关联；SCIM 用户只能通过 SCIM 路径被识别 | AC-BIND-4 |
+| `externalId` 变更 | 视为新绑定并告警（audit log）；旧绑定保留 | AC-BIND-4 |
+| 某外部 IdP 无法提供安全关联 | 明确拒绝自动关联或要求管理员确认映射；不承诺无条件三路同人 | AC-BIND-6 |
+
+Casdoor 桥接不需要此声明（第 2 节）。
+
+## 4. 顺序案例表
+
+| # | 顺序 | 终态 | AC |
+|---|---|---|---|
+| 1 | OIDC 先到（Both） | JIT 建号 + `(issuer, sub)` 绑定；随后桥接 `external_id = sub` 命中同一用户 | AC-BIND-1 |
+| 2 | SCIM / 桥接先到 | 建号 + `(source, external_id)` 绑定；随后 OIDC 登录按第 2/3 节规则命中或新建 / 拒绝 | AC-BIND-1、AC-BIND-6 |
+| 3 | 桥接先到，OIDC 后到 | 桥接 `external_id == sub` → 同一用户，追加 OIDC 绑定 | AC-BIND-1 |
+| 4 | 并发首建 | 唯一约束 + 重试取胜者；不产生两个用户 | AC-BIND-1 |
+| 5 | Casdoor 改名（`name` 变） | `id` 不变 → 同一用户；只更新 profile 快照 | AC-BIND-3 |
+| 6 | Casdoor 改邮箱 | 同一用户；email 不是键，不触发合并或拆分 | AC-BIND-3、AC-BIND-2 |
+| 7 | 删除后同名重建 | 新 UUID → 新用户，不接管旧用户的角色 / team / VK；旧用户保持 `active=false` | AC-BIND-3 |
+| 8 | `externalId` 缺失或变化（外部 SCIM 源） | 缺失不关联；变化 = 新绑定 + 告警 | AC-BIND-4 |
+| 9 | `issuerUrl` 或 `organization` 配置变更 | 视为新 source；旧绑定保留并标 `orphaned`，不自动迁移；管理员显式处理 | AC-BIND-5 |
+
+## 5. 同步语义状态表
+
+来源：`docs/enterprise/how-identity-sync-works.mdx:57-78,138-158`。`claimsSyncMode` 取值 `both`（默认）或 `scim`。
+
+| 输入 | SCIM off / Both | SCIM-only | AC |
+|---|---|---|---|
+| claim **absent** | 保留 claim memory 中的上次值 | 引擎在冻结门停下，不改 role / team / BU | AC-SYNC-1 |
+| claim **present but empty / unmatched** | 权威撤回：移除由该属性授予的成员资格；role 无匹配 → 新用户拒绝登录、老用户清除角色 | 同上，不改 | AC-SYNC-1 |
+| OIDC 登录未知用户 | JIT 建号 | 拒绝，提示 "provision via SCIM" | AC-SYNC-2、AC-BIND-6 |
+| SCIM 写入 | 从**持久化的全部** group membership + user attributes 重算角色，更新 claim memory | 同左，且为唯一权威 | AC-SYNC-2、AC-SCIM-5 |
+| Both 下 OIDC 权威 claim 与 SCIM 分配冲突 | 权威 OIDC claim 可以撤回 SCIM 分配的 team（`mdx:139`） | 不适用 | AC-SYNC-2 |
+| SCIM 授予 team → OIDC 权威撤回 → SCIM 更新其他属性 | 终态：team 保持撤回，其他属性更新；SCIM 原始状态仍保存该 group 成员关系 | 不适用 | AC-SYNC-4 |
+| refresh 失败 | 查 IdP active；inactive 则停用 | **永不**因此删除 / 停用；只有 SCIM 可停用；会话本身失效 | AC-SESS-4、AC-DEAC-3 |
+| manual 授予 | 任何同步永不移除 | 同左 | AC-SYNC-3 |
+
+SCIM 原始状态（`scim_groups` / `scim_group_members` / `scim_user_attributes`，含 externalId、version / etag、raw attributes）独立存储，SCIM Group 不等同 Team：未映射的组在配置变更后也可能参与授权，"从所有已知 SCIM 状态重算"依赖它。AC-SCIM-5。
+
+## 6. 来源标记
+
+两个不同组映射同一 Team 时，撤销其中一个不得误删另一个仍授予的关系。存储形式定为**多条 grant 记录，每来源一行**，删除按来源精确匹配。
+
+| 来源 | 形式 | 写入者 | 移除者 | AC |
+|---|---|---|---|---|
+| `manual` | `manual` | 管理员 API / UI | 仅管理员；同步永不移除 | AC-SYNC-3 |
+| `oidc_claim` | `oidc_claim(provider, attribute)` | 登录 / refresh 的 claim 映射 | 同 provider 同 attribute 的权威撤回 | AC-SYNC-1 |
+| `scim_group` | `scim_group(source, group_id)` | SCIM Group 成员写入 / 桥接组事件 | 该 group 移除成员或 group 删除 | AC-SYNC-3、AC-BRIDGE-8 |
+| `scim_user_attr` | `scim_user_attr(source, attribute)` | SCIM User 属性映射 | 该属性变更 | AC-SYNC-3 |
+
+角色同样带来源与优先级：`manual` 高于映射。v1 是否开放手动改角色由 Phase 3 决定；若开放，必须带 `manual` 来源，映射结果不覆盖它。AC-SYNC-3。
+
+## 7. 角色解析
+
+| 规则 | AC |
+|---|---|
+| 无匹配角色 → 拒绝登录（新用户）或清除角色（老用户，随后 governance 拒绝请求） | AC-SYNC-5、AC-SYNC-6 |
+| 多命中 → `roleResolutionStrategy` 默认 `highestPermissionCount`；`order` 取映射列表首个命中 | AC-SYNC-5 |
+| 首个管理员 → 经 break-glass admin 账密显式建立，或经 `attributeRoleMappings` 显式映射；**不做隐式提升** | AC-SYNC-5 |
+| Casdoor `groups` claim 的精确格式（`org/group` 分隔）待 Phase 3 实测；`${*}` 通配是否可用取决于此 | AC-SYNC-1 |
+
+## 8. 三种删除动作
+
+| 动作 | 触发 | 行为 | AC |
+|---|---|---|---|
+| Admin `DELETE /api/governance/users/{id}` | 管理员 | 永久删除并级联清理；禁止删除自己（`users.yaml:220-225`） | AC-RBAC-1 |
+| SCIM `DELETE /scim/v2/Users/{id}` | provisioning client | 协议层删除：后续 GET / list 404 与隐藏（RFC 7644 §3.6）；底层保留用于日志关联；再次创建默认得到新内部 ID（按 `externalId` 复活由 Phase 4 定） | AC-SCIM-1 |
+| `active: false`（SCIM PATCH / 桥接软停用） | provisioning client / 桥接 | 软停用；触发第 5 节失效面（见 Auth 文档） | AC-DEAC-1 |
+
+重新 provision 后旧 session / refresh / MCP grant / 个人 VK 不自动复活。AC-DEAC-5。
+
+## 9. Casdoor 删除判据
+
+| 回查结果 | 判定 | AC |
+|---|---|---|
+| `GET /api/get-user?userId=<uuid>&owner=<org>` → `{"status":"ok","data":null}` | 不存在（硬删除）→ 软停用 | AC-BRIDGE-6 |
+| 返回行 `isDeleted: true`（组织开启 `enableSoftDeletion`） | 按停用处理 | AC-BRIDGE-6 |
+| 返回行 `isForbidden: true` | 按停用处理 | AC-BRIDGE-6 |
+| timeout / 5xx / 非 `status: ok` | 重试，不停用 | AC-BRIDGE-6、AC-DEAC-3 |
+
+样本 `framework/identity/casdoor/testdata/get-user-missing.json` 即 `data: null` 形状。下线一律软停用，不硬删本地用户。

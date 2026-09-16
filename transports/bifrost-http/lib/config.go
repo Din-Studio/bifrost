@@ -195,6 +195,10 @@ type ConfigData struct {
 	Plugins           []*schemas.PluginConfig               `json:"plugins,omitempty"`
 	WebSocket         *schemas.WebSocketConfig              `json:"websocket,omitempty"`
 	FeatureFlags      *FeatureFlagsFileConfig               `json:"feature_flags,omitempty"`
+	// ScimConfig and IdentitySync are file-sourced only (no DB persistence,
+	// no API exposure, restart required to change). See configidentity.go.
+	ScimConfig   *ScimConfig         `json:"scim_config,omitempty"`
+	IdentitySync *IdentitySyncConfig `json:"identity_sync,omitempty"`
 
 	presentSections           map[string]bool
 	presentGovernanceSections map[string]bool
@@ -462,6 +466,8 @@ func (cd *ConfigData) UnmarshalJSON(data []byte) error {
 		WebSocket         *schemas.WebSocketConfig              `json:"websocket,omitempty"`
 		FeatureFlags      *FeatureFlagsFileConfig               `json:"feature_flags,omitempty"`
 		SkillsRegistry    *SkillsRegistryConfig                 `json:"skills_registry,omitempty"`
+		ScimConfig        *ScimConfig                           `json:"scim_config,omitempty"`
+		IdentitySync      *IdentitySyncConfig                   `json:"identity_sync,omitempty"`
 	}
 
 	var temp TempConfigData
@@ -506,6 +512,8 @@ func (cd *ConfigData) UnmarshalJSON(data []byte) error {
 		}
 	}
 	cd.SkillsRegistry = temp.SkillsRegistry
+	cd.ScimConfig = temp.ScimConfig
+	cd.IdentitySync = temp.IdentitySync
 	// Initialize providers map if nil
 	if cd.Providers == nil {
 		cd.Providers = make(map[string]configstore.ProviderConfig)
@@ -593,6 +601,11 @@ type Config struct {
 	GovernanceConfig *configstore.GovernanceConfig
 	FrameworkConfig  *framework.FrameworkConfig
 	ProxyConfig      *configstoreTables.GlobalProxyConfig
+	// ScimConfig is the validated scim_config section, or nil when the section
+	// is absent or disabled. Read from config.json only; never persisted.
+	ScimConfig *ScimConfig
+	// IdentitySync is the validated identity_sync section, or nil when absent.
+	IdentitySync *IdentitySyncConfig
 
 	// SetupToken is the resolved operator-provisioned bootstrap secret (see
 	// ConfigData.SetupToken / resolveSetupToken). Empty when the operator hasn't
@@ -996,6 +1009,14 @@ func LoadConfig(ctx context.Context, configDirPath string) (*Config, error) {
 	}
 	// 6. MCP config
 	loadMCPConfig(ctx, config, &configData)
+	// 6a. Identity config (scim_config + identity_sync): file-sourced, validated,
+	// rejected loudly when it names a provider the OSS build cannot serve.
+	if err := loadScimConfig(ctx, config, &configData); err != nil {
+		return nil, err
+	}
+	if err := loadIdentitySyncConfig(ctx, config, &configData); err != nil {
+		return nil, err
+	}
 	// 7. Webhook endpoints
 	loadWebhooksConfig(ctx, config, &configData)
 	// 8. Governance config

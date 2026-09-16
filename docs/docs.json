@@ -1803,6 +1803,18 @@
               "architecture/framework/vector-store",
               "architecture/framework/streaming"
             ]
+          },
+          {
+            "group": "Identity Architecture",
+            "icon": "id-badge",
+            "pages": [
+              "architecture/identity/overview",
+              "architecture/identity/auth-and-credentials",
+              "architecture/identity/identity-binding-and-sync",
+              "architecture/identity/rbac-matrix",
+              "architecture/identity/casdoor-bridge",
+              "architecture/identity/test-plan"
+            ]
           }
         ]
       },

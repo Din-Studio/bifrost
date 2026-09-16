@@ -1,0 +1,26 @@
+{
+  "status": "ok",
+  "msg": "",
+  "sub": "",
+  "name": "",
+  "data": {
+    "owner": "echojoy",
+    "name": "dev-group-1",
+    "createdTime": "2026-09-06T14:56:49+08:00",
+    "updatedTime": "2026-09-06T14:56:49+08:00",
+    "displayName": "dev-group-1",
+    "manager": "",
+    "contactEmail": "group-manager@example.com",
+    "type": "Physical",
+    "parentId": "echojoy",
+    "parentName": "",
+    "isTopGroup": true,
+    "users": null,
+    "haveChildren": false,
+    "isEnabled": true,
+    "gidNumber": 1001,
+    "properties": {}
+  },
+  "data2": null,
+  "data3": null
+}

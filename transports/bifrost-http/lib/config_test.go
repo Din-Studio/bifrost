@@ -18772,6 +18772,12 @@ func getSchemaTypeMappings() []schemaTypeMapping {
 
 		// Plugins
 		{"plugins", reflect.TypeOf(schemas.PluginConfig{}), true},
+
+		// Identity config (scim_config is enterprise-defined but OSS-parsed; identity_sync is OSS-owned)
+		{"scim_config", reflect.TypeOf(ScimConfig{}), false},
+		{"scim_config.trusted_networks", reflect.TypeOf(ScimTrustedNetwork{}), true},
+		{"identity_sync", reflect.TypeOf(IdentitySyncConfig{}), false},
+		{"identity_sync.casdoor", reflect.TypeOf(CasdoorSyncConfig{}), false},
 	}
 }
 
@@ -18783,7 +18789,6 @@ var enterpriseSchemaPaths = map[string]bool{
 	"audit_logs":                 true,
 	"circuit_breaker_config":     true,
 	"cluster_config":             true,
-	"scim_config":                true,
 	"load_balancer_config":       true,
 	"guardrails_config":          true,
 	"large_payload_optimization": true,
@@ -19242,7 +19247,6 @@ func TestConfigSchemaSyncTopLevel(t *testing.T) {
 		"audit_logs":                 true,
 		"circuit_breaker_config":     true,
 		"cluster_config":             true,
-		"scim_config":                true,
 		"load_balancer_config":       true,
 		"guardrails_config":          true,
 		"large_payload_optimization": true,
@@ -22492,4 +22496,307 @@ func TestReconcileVirtualMCPsConfig_DedupeNameAndID(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, vmcps, 1, "duplicate name with a different ID must be deduped")
 	require.Equal(t, "Dup", vmcps[0].Name)
+}
+
+// ===================================================================================
+// IDENTITY CONFIG (scim_config / identity_sync) TESTS
+// ===================================================================================
+
+// defsProperties returns the `properties` map of a $defs entry, following an
+// array's `items` when the definition is an array. getSchemaPropertiesAtPath
+// only walks top-level `properties`, so nested $defs referenced from
+// scim_config.config (whose shape depends on provider) need this direct lookup.
+func defsProperties(t *testing.T, schema map[string]interface{}, name string) map[string]interface{} {
+	t.Helper()
+	def := resolveSchemaRef(schema, "#/$defs/"+name)
+	require.NotNil(t, def, "$defs.%s must exist", name)
+	if def["type"] == "array" {
+		items, ok := def["items"].(map[string]interface{})
+		require.True(t, ok, "$defs.%s must have object items", name)
+		def = items
+	}
+	props, ok := def["properties"].(map[string]interface{})
+	require.True(t, ok, "$defs.%s must have properties", name)
+	return props
+}
+
+func assertGoTypeMatchesSchemaProps(t *testing.T, label string, goType reflect.Type, props map[string]interface{}) {
+	t.Helper()
+	goFields := getGoStructFields(goType)
+	for prop := range props {
+		assert.Truef(t, goFields[prop], "[%s] field %q in schema but missing from %s", label, prop, goType.Name())
+	}
+	for field := range goFields {
+		_, ok := props[field]
+		assert.Truef(t, ok, "[%s] field %q in %s but missing from schema", label, field, goType.Name())
+	}
+}
+
+// TestConfigSchemaSyncScimDefs pins the generic-provider sub-tree of
+// scim_config, which TestConfigSchemaSync cannot reach because
+// scim_config.config is a provider-dependent raw object.
+func TestConfigSchemaSyncScimDefs(t *testing.T) {
+	schema := loadJSONSchema(t)
+
+	assertGoTypeMatchesSchemaProps(t, "$defs.generic_config", reflect.TypeOf(GenericOIDCConfig{}), defsProperties(t, schema, "generic_config"))
+	assertGoTypeMatchesSchemaProps(t, "$defs.scim_auth_proxy", reflect.TypeOf(ScimAuthProxyConfig{}), defsProperties(t, schema, "scim_auth_proxy"))
+	assertGoTypeMatchesSchemaProps(t, "$defs.scim_attribute_role_mappings", reflect.TypeOf(ScimAttributeRoleMapping{}), defsProperties(t, schema, "scim_attribute_role_mappings"))
+	assertGoTypeMatchesSchemaProps(t, "$defs.scim_attribute_team_mappings", reflect.TypeOf(ScimAttributeTeamMapping{}), defsProperties(t, schema, "scim_attribute_team_mappings"))
+	assertGoTypeMatchesSchemaProps(t, "$defs.scim_attribute_business_unit_mappings", reflect.TypeOf(ScimAttributeBusinessUnitMapping{}), defsProperties(t, schema, "scim_attribute_business_unit_mappings"))
+	assertGoTypeMatchesSchemaProps(t, "$defs.scim_attribute_access_profile_mappings", reflect.TypeOf(ScimAttributeAccessProfileMapping{}), defsProperties(t, schema, "scim_attribute_access_profile_mappings"))
+
+	// scim_claim_attributes is a map whose values are objects
+	claimDef := resolveSchemaRef(schema, "#/$defs/scim_claim_attributes")
+	require.NotNil(t, claimDef)
+	valueSchema, ok := claimDef["additionalProperties"].(map[string]interface{})
+	require.True(t, ok, "$defs.scim_claim_attributes must define object values via additionalProperties")
+	valueProps, ok := valueSchema["properties"].(map[string]interface{})
+	require.True(t, ok)
+	assertGoTypeMatchesSchemaProps(t, "$defs.scim_claim_attributes values", reflect.TypeOf(ScimClaimAttribute{}), valueProps)
+
+	// The two secret-bearing fields must be SecretVar so env. references resolve
+	// and API redaction helpers apply.
+	genericType := reflect.TypeOf(GenericOIDCConfig{})
+	for _, name := range []string{"ClientSecret", "ProvisioningToken"} {
+		f, ok := genericType.FieldByName(name)
+		require.True(t, ok)
+		assert.Equal(t, reflect.TypeOf(&schemas.SecretVar{}), f.Type, "%s must be *schemas.SecretVar", name)
+	}
+	f, ok := reflect.TypeOf(CasdoorSyncConfig{}).FieldByName("WebhookSecret")
+	require.True(t, ok)
+	assert.Equal(t, reflect.TypeOf(&schemas.SecretVar{}), f.Type, "WebhookSecret must be *schemas.SecretVar")
+}
+
+func parseIdentityConfigData(t *testing.T, raw string) *ConfigData {
+	t.Helper()
+	var data ConfigData
+	require.NoError(t, json.Unmarshal([]byte(raw), &data))
+	return &data
+}
+
+func TestLoadScimConfig(t *testing.T) {
+	SetLogger(&testLogger{})
+	t.Setenv("BIFROST_TEST_SCIM_CLIENT_SECRET", "super-secret-client-value-1234")
+
+	tests := []struct {
+		name        string
+		raw         string
+		wantErr     string
+		wantLoaded  bool
+		checkLoaded func(t *testing.T, cfg *Config)
+	}{
+		{
+			name:       "section absent is a no-op",
+			raw:        `{}`,
+			wantLoaded: false,
+		},
+		{
+			name:       "enabled false is a no-op even with an enterprise provider",
+			raw:        `{"scim_config":{"enabled":false,"provider":"okta","config":{}}}`,
+			wantLoaded: false,
+		},
+		{
+			name:    "enabled without provider is rejected",
+			raw:     `{"scim_config":{"enabled":true}}`,
+			wantErr: "scim_config.provider: required",
+		},
+		{
+			name:    "enterprise provider is rejected, not ignored",
+			raw:     `{"scim_config":{"enabled":true,"provider":"okta","config":{"domain":"x.okta.com","clientId":"a","clientSecret":"b"}}}`,
+			wantErr: `provider "okta" is not supported in the OSS build (only "generic")`,
+		},
+		{
+			name:    "generic without config is rejected",
+			raw:     `{"scim_config":{"enabled":true,"provider":"generic"}}`,
+			wantErr: "scim_config.config: required",
+		},
+		{
+			name:    "generic missing clientId is rejected",
+			raw:     `{"scim_config":{"enabled":true,"provider":"generic","config":{"issuerUrl":"https://idp.example.com"}}}`,
+			wantErr: "scim_config.config.clientId: required",
+		},
+		{
+			name:    "generic missing issuerUrl is rejected",
+			raw:     `{"scim_config":{"enabled":true,"provider":"generic","config":{"clientId":"bifrost"}}}`,
+			wantErr: "scim_config.config.issuerUrl: required",
+		},
+		{
+			name:    "http issuer without dev flag is rejected",
+			raw:     `{"scim_config":{"enabled":true,"provider":"generic","config":{"issuerUrl":"http://localhost:8001","clientId":"bifrost"}}}`,
+			wantErr: "must use https",
+		},
+		{
+			name:    "trusted_networks does not exempt http issuer",
+			raw:     `{"scim_config":{"enabled":true,"provider":"generic","config":{"issuerUrl":"http://localhost:8001","clientId":"bifrost"},"trusted_networks":[{"cidr":"127.0.0.1"}]}}`,
+			wantErr: "must use https",
+		},
+		{
+			name:       "http issuer with dev flag is accepted",
+			raw:        `{"scim_config":{"enabled":true,"provider":"generic","config":{"issuerUrl":"http://localhost:8001","clientId":"bifrost"}},"identity_sync":{"allow_insecure_issuer_for_dev":true}}`,
+			wantLoaded: true,
+		},
+		{
+			name:    "non-http scheme is rejected",
+			raw:     `{"scim_config":{"enabled":true,"provider":"generic","config":{"issuerUrl":"ldap://idp","clientId":"bifrost"}}}`,
+			wantErr: "must use https",
+		},
+		{
+			name:    "invalid trusted network entry is rejected",
+			raw:     `{"scim_config":{"enabled":true,"provider":"generic","config":{"issuerUrl":"https://idp.example.com","clientId":"bifrost"},"trusted_networks":[{"cidr":"idp.example.com"}]}}`,
+			wantErr: "scim_config.trusted_networks[0].cidr",
+		},
+		{
+			name:       "generic https config with env-backed secrets is loaded and redactable",
+			raw:        `{"scim_config":{"enabled":true,"provider":"generic","config":{"issuerUrl":"https://idp.example.com","clientId":"bifrost","clientSecret":"env.BIFROST_TEST_SCIM_CLIENT_SECRET","provisioningToken":"plain-provisioning-token-value","scopes":["openid","profile"],"attributeRoleMappings":[{"attribute":"groups","value":"echojoy/admins","role":"Admin"}],"claimScimAttributes":{"groups":{"attributeType":"group","attributeValue":"displayName"}}},"trusted_networks":[{"cidr":"10.20.0.0/16","description":"lab"}]}}`,
+			wantLoaded: true,
+			checkLoaded: func(t *testing.T, cfg *Config) {
+				generic, err := cfg.ScimConfig.Generic()
+				require.NoError(t, err)
+				assert.Equal(t, "https://idp.example.com", generic.IssuerURL)
+				assert.Equal(t, []string{"openid", "profile"}, generic.Scopes)
+				assert.Equal(t, "Admin", generic.AttributeRoleMappings[0].Role)
+				assert.Equal(t, "group", generic.ClaimScimAttributes["groups"].AttributeType)
+				require.NotNil(t, generic.ClientSecret)
+				assert.True(t, generic.ClientSecret.IsFromEnv())
+				assert.Equal(t, "super-secret-client-value-1234", generic.ClientSecret.GetValue())
+				assert.NotContains(t, generic.ClientSecret.Redacted().GetValue(), "secret-client-value")
+				require.NotNil(t, generic.ProvisioningToken)
+				assert.NotContains(t, generic.ProvisioningToken.Redacted().GetValue(), "provisioning-token")
+				assert.Equal(t, "10.20.0.0/16", cfg.ScimConfig.TrustedNetworks[0].Cidr)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{}
+			err := loadScimConfig(context.Background(), cfg, parseIdentityConfigData(t, tt.raw))
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				assert.Nil(t, cfg.ScimConfig, "rejected config must not be published")
+				return
+			}
+			require.NoError(t, err)
+			if !tt.wantLoaded {
+				assert.Nil(t, cfg.ScimConfig)
+				return
+			}
+			require.NotNil(t, cfg.ScimConfig)
+			if tt.checkLoaded != nil {
+				tt.checkLoaded(t, cfg)
+			}
+		})
+	}
+}
+
+func TestLoadIdentitySyncConfig(t *testing.T) {
+	const scimOK = `"scim_config":{"enabled":true,"provider":"generic","config":{"issuerUrl":"https://casdoor.example.com","clientId":"bifrost","clientSecret":"s"}}`
+
+	tests := []struct {
+		name    string
+		raw     string
+		wantErr string
+		check   func(t *testing.T, cfg *Config)
+	}{
+		{
+			name: "section absent is a no-op",
+			raw:  `{}`,
+			check: func(t *testing.T, cfg *Config) {
+				assert.Nil(t, cfg.IdentitySync)
+			},
+		},
+		{
+			name: "casdoor disabled needs no scim_config",
+			raw:  `{"identity_sync":{"casdoor":{"enabled":false,"organization":"echojoy"}}}`,
+			check: func(t *testing.T, cfg *Config) {
+				require.NotNil(t, cfg.IdentitySync)
+				assert.False(t, cfg.IdentitySync.Casdoor.Enabled)
+			},
+		},
+		{
+			name:    "casdoor enabled without scim_config is rejected",
+			raw:     `{"identity_sync":{"casdoor":{"enabled":true,"organization":"echojoy"}}}`,
+			wantErr: "identity_sync.casdoor.enabled: requires scim_config.enabled=true",
+		},
+		{
+			name:    "casdoor enabled without organization is rejected",
+			raw:     `{` + scimOK + `,"identity_sync":{"casdoor":{"enabled":true,"organization":" "}}}`,
+			wantErr: "identity_sync.casdoor.organization: required",
+		},
+		{
+			name:    "invalid scan_interval is rejected",
+			raw:     `{` + scimOK + `,"identity_sync":{"casdoor":{"enabled":true,"organization":"echojoy","scan_interval":"15 minutes"}}}`,
+			wantErr: "identity_sync.casdoor.scan_interval",
+		},
+		{
+			name:    "negative inventory_interval is rejected",
+			raw:     `{` + scimOK + `,"identity_sync":{"casdoor":{"enabled":true,"organization":"echojoy","inventory_interval":"-1h"}}}`,
+			wantErr: "identity_sync.casdoor.inventory_interval",
+		},
+		{
+			name:    "page_size above cap is rejected",
+			raw:     `{` + scimOK + `,"identity_sync":{"casdoor":{"enabled":true,"organization":"echojoy","page_size":5000}}}`,
+			wantErr: "identity_sync.casdoor.page_size",
+		},
+		{
+			name:    "invalid webhook cidr is rejected",
+			raw:     `{` + scimOK + `,"identity_sync":{"casdoor":{"enabled":true,"organization":"echojoy","allowed_webhook_cidrs":["casdoor.internal"]}}}`,
+			wantErr: "identity_sync.casdoor.allowed_webhook_cidrs[0]",
+		},
+		{
+			name:    "link_external_id_to_issuer must be a URL",
+			raw:     `{"identity_sync":{"link_external_id_to_issuer":"not a url"}}`,
+			wantErr: "identity_sync.link_external_id_to_issuer",
+		},
+		{
+			name: "valid casdoor block applies defaults and resolves env secret",
+			raw:  `{` + scimOK + `,"identity_sync":{"casdoor":{"enabled":true,"organization":"echojoy","webhook_secret":"env.BIFROST_TEST_CASDOOR_WEBHOOK_SECRET","allowed_webhook_cidrs":["10.0.0.0/8","192.168.1.5"]},"link_external_id_to_issuer":"https://casdoor.example.com"}}`,
+			check: func(t *testing.T, cfg *Config) {
+				require.NotNil(t, cfg.IdentitySync)
+				c := cfg.IdentitySync.Casdoor
+				require.NotNil(t, c)
+				assert.Equal(t, "echojoy", c.Organization)
+				assert.Equal(t, 15*time.Minute, c.ScanIntervalDuration())
+				assert.Equal(t, 24*time.Hour, c.InventoryIntervalDuration())
+				assert.Equal(t, 100, c.EffectivePageSize())
+				require.NotNil(t, c.WebhookSecret)
+				assert.True(t, c.WebhookSecret.IsFromEnv())
+				assert.Equal(t, "hook-secret-value-abcdefgh", c.WebhookSecret.GetValue())
+				assert.NotContains(t, c.WebhookSecret.Redacted().GetValue(), "secret-value")
+				assert.Equal(t, "https://casdoor.example.com", cfg.IdentitySync.LinkExternalIDToIssuer)
+			},
+		},
+		{
+			name: "explicit intervals and page size are honored",
+			raw:  `{` + scimOK + `,"identity_sync":{"casdoor":{"enabled":true,"organization":"echojoy","scan_interval":"5m","inventory_interval":"12h","page_size":250}}}`,
+			check: func(t *testing.T, cfg *Config) {
+				c := cfg.IdentitySync.Casdoor
+				assert.Equal(t, 5*time.Minute, c.ScanIntervalDuration())
+				assert.Equal(t, 12*time.Hour, c.InventoryIntervalDuration())
+				assert.Equal(t, 250, c.EffectivePageSize())
+			},
+		},
+	}
+
+	SetLogger(&testLogger{})
+	t.Setenv("BIFROST_TEST_CASDOOR_WEBHOOK_SECRET", "hook-secret-value-abcdefgh")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{}
+			data := parseIdentityConfigData(t, tt.raw)
+			require.NoError(t, loadScimConfig(context.Background(), cfg, data))
+			err := loadIdentitySyncConfig(context.Background(), cfg, data)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				assert.Nil(t, cfg.IdentitySync, "rejected config must not be published")
+				return
+			}
+			require.NoError(t, err)
+			if tt.check != nil {
+				tt.check(t, cfg)
+			}
+		})
+	}
 }

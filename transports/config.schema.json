@@ -3430,6 +3430,9 @@
     },
     "circuit_breaker_config": {
       "$ref": "#/$defs/circuit_breaker_config"
+    },
+    "identity_sync": {
+      "$ref": "#/$defs/identity_sync"
     }
   },
   "additionalProperties": false,
@@ -9159,6 +9162,70 @@
         "required": ["attribute", "value"],
         "additionalProperties": false
       }
+    },
+    "identity_sync": {
+      "type": "object",
+      "description": "OSS identity-sync extensions layered on top of scim_config. Holds settings that do not belong to the generic OIDC provider contract: the Casdoor directory bridge and development-only relaxations. Requires scim_config.enabled=true with provider 'generic' when any sub-block is enabled.",
+      "properties": {
+        "casdoor": {
+          "$ref": "#/$defs/identity_sync_casdoor"
+        },
+        "allow_insecure_issuer_for_dev": {
+          "type": "boolean",
+          "default": false,
+          "description": "Development only: accept a plain http:// issuerUrl in scim_config.config. Production deployments must use HTTPS; scim_config.trusted_networks does NOT exempt an issuer from this requirement. Bifrost logs a warning at startup when this flag is in effect."
+        },
+        "link_external_id_to_issuer": {
+          "type": "string",
+          "format": "uri",
+          "description": "Optional. Declares that the externalId pushed by an external SCIM provisioning client equals the OIDC 'sub' issued by this issuer URL, so SCIM-created users and OIDC logins from that issuer are linked as the same person. When unset, SCIM externalId values are never used to link to OIDC identities: an OIDC login that has no binding creates a new user (claims sync mode 'both') or is rejected (claims sync mode 'scim'). The Casdoor bridge does not need this: it always writes external_id = Casdoor User.Id, which is the OIDC sub of the same issuer."
+        }
+      },
+      "additionalProperties": false
+    },
+    "identity_sync_casdoor": {
+      "type": "object",
+      "description": "Casdoor directory bridge. Keeps Bifrost users, groups and deactivations in step with a Casdoor organization through Casdoor's native API (webhooks + incremental scan + periodic full inventory). Directory API calls authenticate with the application clientId/clientSecret already configured in scim_config.config (Casdoor Basic auth), so no extra credential is needed here.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Turn the Casdoor bridge on. Requires scim_config.enabled=true and scim_config.provider='generic' pointing at the same Casdoor instance."
+        },
+        "organization": {
+          "type": "string",
+          "description": "Casdoor organization whose users and groups are mirrored (the 'owner' value in Casdoor's native API). Exactly one organization per bridge."
+        },
+        "webhook_secret": {
+          "type": "string",
+          "description": "Bearer token Casdoor must send in the Authorization header of the webhook it posts to Bifrost (configured as a static header on the Casdoor webhook; Casdoor does not sign payloads). Kept separate from scim_config.config.provisioningToken so the two can be rotated independently. Supports the env. prefix for environment-variable references."
+        },
+        "scan_interval": {
+          "type": "string",
+          "default": "15m",
+          "description": "How often the bridge runs an incremental scan (get-users sorted by updatedTime since the last committed cursor) to catch changes whose webhook was lost. Go duration string, e.g. '15m'."
+        },
+        "inventory_interval": {
+          "type": "string",
+          "default": "24h",
+          "description": "How often the bridge pulls the full user and group inventory of the organization and diffs it against local state. This is the only path that discovers hard deletions when webhooks are lost. Go duration string, e.g. '24h'."
+        },
+        "page_size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000,
+          "default": 100,
+          "description": "Page size for Casdoor native list endpoints (get-users, get-groups)."
+        },
+        "allowed_webhook_cidrs": {
+          "type": "array",
+          "description": "Optional source-IP allowlist for the bridge webhook endpoint, in addition to the bearer secret. Entries are IPs or CIDR ranges. Empty or omitted means any source IP may post as long as the secret matches.",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": ["enabled", "organization"],
+      "additionalProperties": false
     }
   }
 }

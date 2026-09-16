@@ -1,0 +1,239 @@
+---
+title: "Casdoor Bridge"
+description: "Casdoor 目录桥接契约：webhook 载荷语义、原生 API 事实、identity_sync.casdoor 配置、可靠性规则与脱敏样本清单。基于 Casdoor v4.1.0 实测。"
+icon: "arrows-rotate"
+---
+
+本页固定 `framework/identity/casdoor`（Phase 2/4 实现）必须遵守的契约。所有事实均在 2026-09-16 对本机 Casdoor **v4.1.0**（commit `9603cdd`，`/api/get-version-info` 实测）验证，并已固化为 `framework/identity/casdoor/testdata/` 中的脱敏样本。凡与 PRD 或 Phase 1 计划原先假设不符之处，以本页为准。
+
+验收 ID 引用 [Identity Test Plan](/architecture/identity/test-plan)。
+
+## 1. 桥接器的职责与数据源
+
+桥接器是 Bifrost 进程内组件，把一个 Casdoor 组织（`identity_sync.casdoor.organization`）的用户、组、停用状态同步进 `framework/identity` 的领域写入服务。它有三条输入路径，三者必须在终态上同构（AC-BRIDGE-3）：
+
+| 路径 | 触发 | 作用 |
+|---|---|---|
+| Webhook | Casdoor 投递 `Record` 事件 | 低延迟感知变更；**只是提示**，写入前一律回查 |
+| 增量扫描 | 每 `scan_interval`（默认 15m） | `get-users` 按 `updatedTime` 自游标起拉取，补 webhook 丢失 |
+| 完整 inventory | 每 `inventory_interval`（默认 24h） | 全量 `get-users` + `get-groups` 与本地 diff，**唯一**能发现硬删除的路径 |
+
+数据源只用 Casdoor **原生 API**（`/api/get-users` 等），不用 Casdoor 的 `/scim/*`（filter 静默忽略、`totalResults` 错误、Group 无成员，见 PRD 证据表）。
+
+## 2. Webhook 载荷语义（v4.1.0 实测，修正计划假设）
+
+投递体是 Casdoor `object.Record` 外加 `extendedUser`（`object/webhook_util.go:27-94`，`RecordEx` 结构）。字段：
+
+```text
+id, owner, name, createdTime, organization, clientIp, user, method,
+requestUri, action, language, object, response, statusCode, detail,
+isTriggered, extendedUser
+```
+
+<Warning>
+**`Record.user`、`Record.organization`、`extendedUser` 描述的是操作者（执行该操作的管理员），不是受影响的用户。** 实测中所有事件的 `extendedUser.id` 都是 `built-in/admin` 的 UUID，`Record.organization` 为 `built-in`，而被增删改的用户属于 `echojoy`。Phase 1 计划中"用 `extendedUser.id` 取受影响用户 UUID"的假设**不成立**，本页撤回。
+</Warning>
+
+受影响对象在 `Record.object` 里，它是原始请求体的 JSON **字符串**：
+
+| `action` | `Record.object` 内容 | 能否直接得到 UUID |
+|---|---|---|
+| `add-user` | 请求体：`owner`、`name`、`displayName`、`email`、`password`…，**无 `id`** | 否，必须回查 |
+| `update-user` | 完整用户对象：`owner`、`name`、`id`（UUID）、`updatedTime`… | 是（仍须回查） |
+| `delete-user` | 调用方提交的用户对象，通常含 `owner`、`name`、`id` | 通常是，但不保证 |
+| `add-group` / `update-group` / `delete-group` | `owner`、`name`、`displayName`、`parentId`…；**组没有 UUID** | 不适用 |
+
+主体识别契约（AC-BRIDGE-5）：
+
+1. 主体 = `Record.object.owner` + `Record.object.name`；`Record.object.id` 存在时作为首选回查键。
+2. 写入前**必须回查**：有 `id` 时 `GET /api/get-user?userId={uuid}&owner={org}`，否则 `GET /api/get-user?id={owner}/{name}`。回查结果（而非载荷）才是写入依据。
+3. `extendedUser.id` **永不**作为主体。`isUserExtended: true` 无害（便于审计操作者），但对主体识别没有帮助。
+4. `Record.object` 解析失败或 `owner` 不等于配置的 `organization` → 记录并丢弃，不写入。
+5. 组事件按 `owner/name` 定位组，然后触发受影响用户重算（第 6 节）。
+
+### 事件表与回查动作
+
+| `action` | 回查 | 写入动作 |
+|---|---|---|
+| `add-user` | `get-user?id=owner/name` | 建号或绑定（`external_id = User.Id`，见 [identity-binding-and-sync](/architecture/identity/identity-binding-and-sync)）；`isForbidden`/`isDeleted` 为 true 则以停用态建号 |
+| `update-user` | 同上，优先 `userId` | 比较 `updatedTime` 版本栅栏后更新 profile、groups、roles、active |
+| `delete-user` | `get-user?userId=&owner=` | `data: null` → 软停用（`active=false`，原因 `casdoor_deleted`）；非空且 `isDeleted: true` → 软停用；非空且正常 → 视为误报，按 update 处理（AC-BRIDGE-6） |
+| `add-group` / `update-group` | `get-group?id=owner/name` | 更新组镜像；重算该组当前成员与本地记录曾属于该组的用户 |
+| `delete-group` | `get-group` 返回 `data: null` | 标记组删除；重算所有曾属于该组的用户（AC-BRIDGE-8） |
+
+回查返回 timeout / 5xx / 网络错误 → 任务重试，不改本地状态（AC-DEAC-3、AC-BRIDGE-6）。
+
+## 3. Webhook 的组织匹配与投递 worker（运维前提）
+
+### 组织匹配
+
+`object/record.go:329-336` 的 `SendWebhooks` 用 `getWebhooksByOrganization("")` 取**全部** webhook（xorm 忽略零值条件），再由 `getFilteredWebhooks` 按 `record.Action` 匹配 `events`；只有 webhook 的 `singleOrgOnly: true` 时才额外要求 `webhook.Organization == Record.organization`（`record.go:253-257`）。而 `Record.organization` 是**操作者**所属组织：控制台管理员在 `built-in`，即使它修改的是 `echojoy` 的用户，记录也归 `built-in`。实测：webhook 先注册在 `echojoy`、后改为 `built-in`，两轮事件都入队（`singleOrgOnly: false`）。
+
+契约：
+
+1. 桥接 webhook 使用 `singleOrgOnly: false`，让 Casdoor 把所有组织的匹配事件都投递过来；**按目标组织过滤是桥接自己的责任**——`Record.object.owner != identity_sync.casdoor.organization` 的事件记录并丢弃（第 2 节规则 4）。
+2. 若运维者坚持 `singleOrgOnly: true`，webhook 的 `organization` 必须填**执行目录变更的操作者所在组织**（通常 `built-in`），而不是被同步的组织；文档与配置向导必须写明。
+3. 其它来源（自助改资料、第三方登录、API 账号）的变更靠增量扫描与完整 inventory 兜底（AC-BRIDGE-3）。
+
+### 投递 worker 只在启动时决定是否运行
+
+`object/webhook_worker.go` 的 `StartWebhookDeliveryWorker()` 由 `main.go:148-149` 在进程启动时调用一次；若此时 `HasAnyWebhooks()` 为 false，函数直接返回，worker **不会**再被启动。后果：在无 webhook 的 Casdoor 实例上新建 webhook 后，事件全部停在 `state: Pending`，直到 Casdoor 重启。实测 12 个事件全部 Pending，重启前只能靠 `POST /api/replay-webhook-event?id=admin/{eventName}` 手动投递。
+
+运维契约（AC-BRIDGE-10）：
+
+1. 先创建 webhook，再重启 Casdoor。
+2. 用 `GET /api/get-webhook-events?webhook=admin/{name}&pageSize=20&p=1` 验证 `state` 从 `Pending` 变为 `Success`。
+3. 无论 webhook 是否健康，扫描与 inventory 路径必须始终开启；桥接器不得因"webhook 已配置"而降低扫描频率。
+
+worker 参数（v4.1.0 源码）：轮询 30 s，每批 100 条；失败重试 `maxRetries`（webhook 级，默认 3）、`retryInterval`（默认 60 s）、可选指数退避封顶 3600 s。`replay-webhook-event` 会重置事件并立即投递一次。
+
+## 4. 投递的 HTTP 形状与端点认证
+
+实测投递：
+
+```text
+POST {webhook.url}
+Content-Type: application/json
+User-Agent: Go-http-client/1.1
+Authorization: Bearer {webhook_secret}   ← webhook 上配置的静态 header
+```
+
+Casdoor **不签名**载荷，只透传静态 header。桥接端点契约（AC-BRIDGE-4）：
+
+| 检查 | 结果 |
+|---|---|
+| `Authorization` 缺失或不等于 `Bearer {identity_sync.casdoor.webhook_secret}` | `401`，不解析 body |
+| `allowed_webhook_cidrs` 非空且源 IP 不在列表内 | `403` |
+| 通过认证 | 持久化任务后 `202`；解析失败也返回 `202` 并记录，避免 Casdoor 无意义重试 |
+| RBAC | 不进 RBAC，不需要 session；路径进入认证白名单（见 [rbac-matrix](/architecture/identity/rbac-matrix)） |
+
+`webhook_secret` 与 `scim_config.config.provisioningToken` 是两把独立密钥，分别轮换；轮换 `webhook_secret` 时先更新 Casdoor webhook header 再更新 Bifrost 配置（Phase 3 前配置变更需重启）。
+
+## 5. 原生 API 事实
+
+| 项 | 实测 / 源码 |
+|---|---|
+| 登录 | `POST /api/login`，body `{"application":"app-built-in","organization":"built-in","username":…,"password":…,"autoSignin":true,"signinMethod":"Password","type":"login"}`，返回 cookie。**桥接器不用此路径**，见下行 |
+| 桥接器认证 | 复用 `scim_config.config.clientId` / `clientSecret` 做 Casdoor 应用 Basic 认证；不新增凭据 |
+| 用户列表 | `GET /api/get-users?owner={org}&pageSize={n}&p={page}&sortField=updatedTime&sortOrder=descend`；`data2` 为**准确总数**（实测 3090）；`field={col}&value={v}` 过滤有效 |
+| 单用户 | `GET /api/get-user?id={owner}/{name}` 或 `?userId={uuid}&owner={org}` |
+| 用户不存在 | `{"status":"ok","msg":"","data":null,"data2":null}`（样本 `get-user-missing.json`） |
+| 组列表 | `GET /api/get-groups?owner={org}`；`users` 为 `null`（成员关系只在 `User.groups`）；`parentId` 可指向其它组织（实测 `built-in`） |
+| 删除语义 | 本机两个组织 `enableSoftDeletion=false`，删除即硬删除；开启软删除的组织返回 `isDeleted: true` 的行，按停用处理 |
+| 组织信息 | `GET /api/get-organizations` 可读 `enableSoftDeletion` |
+| 时间戳 | 用户 `updatedTime` 以 `Z` 结尾，组以 `+08:00` 结尾（`util/time.go:22-26` 取进程本地时区，历史写入时区不同）；**比较前统一转 UTC**（AC-BRIDGE-9） |
+| 用户标识 | `User.Id` 为 UUID，等于 OIDC `sub`（`object/token_jwt.go:531-550`）；`owner/name` 可改名，永不作键 |
+| `externalId` | 第三方登录时形如 `{provider}:{uuid}`，否则为空；不作键 |
+
+## 6. 可靠性契约
+
+### 串行与版本栅栏
+
+- 以 `user_id`（Casdoor `User.Id`）分片，同一用户的任务**串行**处理（AC-BRIDGE-1）。
+- 版本栅栏只用于**用户级**事件：回查得到的 `updatedTime`（UTC）早于本地已存版本则丢弃。
+- 组事件、映射配置变更、完整 inventory 不用用户时间戳排序；它们触发"受影响用户重算"，重算读取回查时刻的完整状态（AC-BRIDGE-8）。
+
+### 持久任务与幂等
+
+- 每个 webhook / 扫描发现 / inventory diff 都写入持久任务表（`identity_sync_jobs`，Phase 2），重启后可恢复。
+- 幂等键 `(source, action, record_id)`；`record_id` 对 webhook 为 `Record.id`，对扫描为 `{uuid}@{updatedTime}`；重复投递与 replay 去重（AC-BRIDGE-1）。
+- 任务领取与续租复用 `framework/webhooks/dispatcher.go` 的 lease / fencing 模式。
+
+### 游标
+
+- 游标存于 `identity_sync_cursors`，**只在整批任务成功提交后推进**（AC-BRIDGE-7）。
+- 扫描条件 `updatedTime >= cursor`（含等号），按 `id` 去重，避免同一时间戳边界漏项；分页期间新增或修改的行由下一轮 `>=` 覆盖。
+- 批次内任一用户失败 → 游标不动，失败用户进入重试，其余用户的写入保留（写入本身幂等）。
+
+### 完整 inventory
+
+- 分页拉全量 `get-users` 与 `get-groups`；用 `data2` 校验收到的总行数，**不一致则本轮作废**。
+- 本地存在、目录缺失的用户 → 逐个回查 `get-user?userId=&owner=` 确认 `data: null` 后软停用；回查错误则跳过本轮。
+- 分页不完整、部分回查失败、`data2` 不匹配都**不触发批量停用**（AC-BRIDGE-2）。
+- 所有下线一律软停用（`active=false`），永不硬删本地用户；删除判据统一为 `data: null`（AC-BIND-3、AC-BRIDGE-6）。
+
+### 与停用 SLA 的关系
+
+| 面 | 目标 |
+|---|---|
+| webhook 健康 | 事件 ≤ 30 s worker 轮询 + 回查时延 |
+| webhook 丢失 | ≤ `scan_interval` + 处理时延 |
+| 硬删除 | ≤ `inventory_interval` + 处理时延 |
+
+详见 [auth-and-credentials](/architecture/identity/auth-and-credentials) 的停用 SLA 分面表。
+
+## 7. `identity_sync.casdoor` 配置
+
+schema 定义在 `transports/config.schema.json` 的 `$defs.identity_sync_casdoor`；类型在 `transports/bifrost-http/lib/configidentity.go`。
+
+| 字段 | 类型 | 默认 | 语义 |
+|---|---|---|---|
+| `enabled` | boolean（必填） | — | 开启桥接 |
+| `organization` | string（必填） | — | 镜像的 Casdoor 组织（原生 API 的 `owner`），一个桥接一个组织 |
+| `webhook_secret` | string | — | Casdoor webhook 静态 `Authorization: Bearer …` 的值；支持 `env.` 前缀；类型 `*schemas.SecretVar` |
+| `scan_interval` | Go duration | `15m` | 增量扫描周期 |
+| `inventory_interval` | Go duration | `24h` | 完整 inventory 周期 |
+| `page_size` | integer 1–1000 | `100` | `get-users` / `get-groups` 分页大小 |
+| `allowed_webhook_cidrs` | string[] | 空 | webhook 端点源 IP 白名单，空则不限制 |
+
+启动校验（`loadIdentitySyncConfig`，AC-CFG-4）：
+
+- `casdoor.enabled=true` 要求 `scim_config.enabled=true` 且 `provider="generic"`（目录 API 复用其 `clientId` / `clientSecret`），否则启动失败。
+- `organization` 不能为空白；duration 必须能被 `time.ParseDuration` 解析且为正；`page_size` 在 `[1, 1000]`；CIDR 条目必须是合法 IP 或 CIDR。
+- `scim_config.config.issuerUrl` 必须是 `https://`，除非 `identity_sync.allow_insecure_issuer_for_dev=true`（仅开发，启动时 warn；`trusted_networks` 不豁免）。
+- 错误信息带完整字段路径，如 `identity_sync.casdoor.scan_interval: "15 minutes" is not a Go duration`。
+
+Phase 1 只有文件来源；DB 持久化、`/api/config` 暴露、向导留 Phase 4，Phase 3 前任何变更都需重启。
+
+示例：
+
+```json
+{
+  "scim_config": {
+    "enabled": true,
+    "provider": "generic",
+    "config": {
+      "issuerUrl": "https://casdoor.internal.example.com",
+      "clientId": "bifrost",
+      "clientSecret": "env.CASDOOR_CLIENT_SECRET"
+    }
+  },
+  "identity_sync": {
+    "casdoor": {
+      "enabled": true,
+      "organization": "echojoy",
+      "webhook_secret": "env.CASDOOR_WEBHOOK_SECRET",
+      "scan_interval": "15m",
+      "inventory_interval": "24h",
+      "page_size": 100,
+      "allowed_webhook_cidrs": ["10.20.0.0/16"]
+    }
+  }
+}
+```
+
+## 8. 脱敏样本清单
+
+位置：`framework/identity/casdoor/testdata/`。来源：本机 Casdoor v4.1.0（commit `9603cdd`），抓取日期 2026-09-16。Phase 2/4 的 adapter 单测直接消费这些文件（AC-BRIDGE-5、AC-BRIDGE-9）。
+
+| 文件 | 来源 | 用途 |
+|---|---|---|
+| `discovery.json` | `GET /.well-known/openid-configuration` | 端点、`S256`、`offline_access` |
+| `user.json` | `GET /api/get-user?id=echojoy/{name}` | 用户对象完整形状；`id` 为 UUID |
+| `group.json` | `GET /api/get-group?id=echojoy/dev-group-1` | 组对象；`users: null`、`+08:00` 时间戳 |
+| `get-users-page.json` | `get-users?owner=echojoy&pageSize=2&p=1&sortField=updatedTime&sortOrder=descend` | 分页形状、`data2` 总数 |
+| `get-user-missing.json` | 删除后的 `get-user?userId=&owner=` | `data: null` 删除判据 |
+| `webhook-add-user.json` | 临时用户创建事件 | `object` 无 `id` |
+| `webhook-update-user.json` | 临时用户更新事件 | `object.id` 为受影响用户；`extendedUser` 为操作者 |
+| `webhook-delete-user.json` | 临时用户删除事件 | 同上 |
+| `webhook-add-group.json` / `webhook-update-group.json` / `webhook-delete-group.json` | 临时组生命周期 | 组事件形状，无 UUID |
+
+抓取步骤：`POST /api/login` 取 cookie → 注册指向本机监听器的临时 webhook（`isUserExtended: true`，静态 `Authorization` header）→ 创建、更新、删除一个临时用户与临时组 → 因 worker 未运行，用 `replay-webhook-event` 逐条投递 → 抓取后删除 webhook、事件、临时用户与临时组。Casdoor 上不留任何残余状态。
+
+脱敏规则：`email`、`contactEmail`、`phone`、`avatar`、`permanentAvatar`、`password*`、`accessKey`/`accessSecret`/`*Token`、`createdIp`/`lastSigninIp`/`clientIp` 替换为占位值；真实样本用户的用户名替换为 `sample-user`；`extendedUser` 是操作者 admin，PII 同样脱敏。保留 `id`、`owner`、`name`、`groups`、`roles`、`permissions`、`isAdmin`、`isForbidden`、`isDeleted`、`createdTime`、`updatedTime`、`externalId`、`data2`。每个文件为纯 JSON，无注释。
+
+## 9. 部署范围与待验证项
+
+- **v1 单实例。** 扫描、inventory、任务领取都假定单进程；多实例失效传播与 lease 协调在 Phase 5（AC-ATTR-4）。
+- **`groups` claim 格式待 Phase 3 实测。** 源码只确认 `GetUserFullGroupPath()` 被调用，本地没有能产 token 的组成员；`attributeTeamMappings` 的 `*` 通配是否可直接用于 `org/group` 复合值，由 Phase 3 首个集成测试决定。
+- **`Record.object` 是请求体而非终态。** 这是所有"必须回查"规则的根因；任何直接消费 `object` 字段写库的实现都违反本契约（AC-BRIDGE-5）。

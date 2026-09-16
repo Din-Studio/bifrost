@@ -1595,3 +1595,44 @@ func TestValidateConfigSchema_BedrockKeyConfig_MissingRegion(t *testing.T) {
 // Guardrails tests are skipped for the public schema as guardrails_config
 // is an enterprise feature with a different schema structure.
 // Enterprise-specific tests should be added to the enterprise test suite.
+
+func TestValidateConfigSchema_IdentitySync(t *testing.T) {
+	valid := `{
+		"scim_config": {
+			"enabled": true,
+			"provider": "generic",
+			"config": {"issuerUrl": "https://casdoor.example.com", "clientId": "bifrost", "clientSecret": "env.CASDOOR_CLIENT_SECRET"}
+		},
+		"identity_sync": {
+			"allow_insecure_issuer_for_dev": false,
+			"link_external_id_to_issuer": "https://casdoor.example.com",
+			"casdoor": {
+				"enabled": true,
+				"organization": "echojoy",
+				"webhook_secret": "env.CASDOOR_WEBHOOK_SECRET",
+				"scan_interval": "15m",
+				"inventory_interval": "24h",
+				"page_size": 100,
+				"allowed_webhook_cidrs": ["10.0.0.0/8"]
+			}
+		}
+	}`
+	if err := ValidateConfigSchema([]byte(valid), loadLocalSchema(t)); err != nil {
+		t.Errorf("expected identity_sync config to pass validation, got error: %v", err)
+	}
+
+	unknownKey := `{"identity_sync": {"foo": true}}`
+	if err := ValidateConfigSchema([]byte(unknownKey), loadLocalSchema(t)); err == nil {
+		t.Error("expected unknown key identity_sync.foo to fail validation")
+	}
+
+	missingOrganization := `{"identity_sync": {"casdoor": {"enabled": true}}}`
+	if err := ValidateConfigSchema([]byte(missingOrganization), loadLocalSchema(t)); err == nil {
+		t.Error("expected identity_sync.casdoor without organization to fail validation")
+	}
+
+	pageSizeOutOfRange := `{"identity_sync": {"casdoor": {"enabled": true, "organization": "echojoy", "page_size": 5000}}}`
+	if err := ValidateConfigSchema([]byte(pageSizeOutOfRange), loadLocalSchema(t)); err == nil {
+		t.Error("expected identity_sync.casdoor.page_size above 1000 to fail validation")
+	}
+}

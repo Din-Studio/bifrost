@@ -1,0 +1,337 @@
+---
+title: "RBAC Matrix"
+description: "OSS 用户体系的资源 × 操作 × 角色矩阵：以实际注册的路由族为行，以 RbacResource enum 为资源名，是 Phase 3 权限种子数据的唯一来源。"
+icon: "table-cells"
+---
+
+本页定义 OSS 版三个系统角色（Admin / Developer / Viewer）对每条管理路由的权限。行来自 `transports/bifrost-http/server/server.go:2312-2529` 实际调用的 `RegisterRoutes` / `RegisterRoutesWithOverrides`，以及各 handler 内注册的 `(方法, 路径)`；资源名只取 `ui/app/_fallbacks/enterprise/lib/contexts/rbacContext.tsx:4-43` 已有的 `RbacResource` 值，操作名只取同文件 `:46-55` 的 `RbacOperation` 值。**不新造资源名、不新造操作名。**
+
+本矩阵是 Phase 3 seed 数据的唯一来源：种子测试逐行比对本页表格，任何差异即失败（AC-RBAC-5）；矩阵每一行都对应一条"非授权角色调用 → 403"的集成测试（AC-RBAC-1）。
+
+## 操作语义
+
+| 操作 | 语义 | v1 使用 |
+|---|---|---|
+| `View` | 列表与详情读取；对含密钥的实体返回**脱敏**值 | 使用 |
+| `Read` | enum 中与 `View` 并存的历史值；OSS 只用 `View`，`Read` 作别名映射到 `View` | 别名 |
+| `Create` | POST 新建 | 使用 |
+| `Update` | PUT / PATCH 修改，含 rotate、reconnect、reauthorize、override 等状态变更 | 使用 |
+| `Delete` | DELETE 删除，含清空日志、清缓存 | 使用 |
+| `Reveal` | 读取密钥明文（provider key value、VK value） | 使用，仅 Admin |
+| `Download` | 日志导出 | 使用，Admin 与 Developer 对 `Logs` |
+| `CreateStandalone` | 企业版语义 | v1 不用 |
+
+## 系统角色
+
+| 角色 | 定义 |
+|---|---|
+| **Admin** | 全部资源全部操作。break-glass 账密登录（`admin` 会话）恒为 Admin。 |
+| **Developer** | 对 `ModelProvider`、`VirtualKeys`、`MCPGateway`、`VirtualMCPs`、`Plugins`、`RoutingRules`、`PromptRepository`、`SkillsRepository`、`Teams`、`Customers`、`Governance` 为 `View` / `Create` / `Update` / `Delete`；对 `Logs`、`MCPLogs`、`Settings`、`Users`、`Metrics`、`Notifications`、`FeatureFlags`、`RBAC` 为 `View`；对 `Logs` 另有 `Download`；无 `Reveal`。 |
+| **Viewer** | 全部有路由资源 `View`；无 `Reveal` / `Create` / `Update` / `Delete` / `Download`。 |
+
+## 资源 × 角色矩阵
+
+| 资源 | Admin | Developer | Viewer |
+|---|---|---|---|
+| `ModelProvider` | View, Create, Update, Delete, Reveal | View, Create, Update, Delete | View |
+| `VirtualKeys` | View, Create, Update, Delete, Reveal | View, Create, Update, Delete | View |
+| `MCPGateway` | View, Create, Update, Delete | View, Create, Update, Delete | View |
+| `VirtualMCPs` | View, Create, Update, Delete | View, Create, Update, Delete | View |
+| `Plugins` | View, Create, Update, Delete | View, Create, Update, Delete | View |
+| `RoutingRules` | View, Create, Update, Delete | View, Create, Update, Delete | View |
+| `PromptRepository` | View, Create, Update, Delete | View, Create, Update, Delete | View |
+| `SkillsRepository` | View, Create, Update, Delete | View, Create, Update, Delete | View |
+| `Teams` | View, Create, Update, Delete | View, Create, Update, Delete | View |
+| `Customers` | View, Create, Update, Delete | View, Create, Update, Delete | View |
+| `Governance` | View, Create, Update, Delete | View, Create, Update, Delete | View |
+| `Logs` | View, Delete, Download | View, Download | View |
+| `MCPLogs` | View, Delete | View | View |
+| `Settings` | View, Update, Delete | View | View |
+| `FeatureFlags` | View, Update | View | View |
+| `Users` | View, Create, Update, Delete | View | View |
+| `RBAC` | View | View | View |
+| `Metrics` | View | View | View |
+| `Notifications` | View, Create | View | View |
+
+说明：
+
+- `Reveal` 仅 Admin（AC-RBAC-4、AC-AUTH-13）。`ModelProvider.View` 与 `VirtualKeys.View` 对非 Admin 返回脱敏值；`handlers/governance.go:1599-1633,1888-1912` 与 `tables/virtualkey.go:320-331` 今日直接返回明文，Phase 3 必须按此矩阵改为脱敏。
+- Viewer 的任何 `Create` / `Update` / `Delete` / `Reveal` / `Download` 都必须服务端 403（AC-RBAC-3）。
+- `RBAC` 资源 v1 只读：系统角色由代码 seed，无角色编辑 API（PRD 已明示为首期裁剪）。
+- `Notifications.Create`（`POST /api/notifications`）留给 Admin，用于系统广播；Developer / Viewer 只订阅。
+- `Users.Create` 指管理员手动建号；SSO JIT 建号与 SCIM / bridge 写入走服务层，不经此权限。
+
+## 路由 → 资源.操作
+
+### 认证层与公开路由（无资源）
+
+| 方法 | 路径 | 处理 | 依据 |
+|---|---|---|---|
+| POST | `/api/session/login` | 公开（白名单） | `handlers/session.go:35`；`middlewares.go:1103` |
+| POST | `/api/session/logout` | 公开（白名单，幂等） | `middlewares.go:1106` |
+| GET | `/api/session/is-auth-enabled` | 公开（白名单） | `middlewares.go:1102` |
+| POST | `/api/session/ws-ticket` | 需认证，任何角色 | `handlers/session.go:35` |
+| GET | `/api/oauth/callback` | 公开（精确白名单） | `handlers/mcpoauth2.go:37`；`middlewares.go:1107` |
+| GET | `/api/version` | 公开（白名单） | `handlers/config.go:121`；`middlewares.go:1117` |
+| GET | `/health` | 公开（白名单） | `handlers/health.go:27` |
+| GET | `/.well-known/oauth-protected-resource[/{path:*}]`、`/.well-known/oauth-authorization-server[/{path:*}]`、`/.well-known/jwks.json` | 公开（前缀白名单） | `handlers/mcpoauth2discovery.go:39`；`middlewares.go:1139` |
+| POST | `/oauth2/register`、`/oauth2/token`；GET `/oauth2/authorize` | 公开，**注册时不挂任何 middleware** | `server.go:2446`；`handlers/mcpoauth2issuance.go:54` |
+| GET | `/robots.txt`、`/`、`/{filepath:*}`（UI） | 公开，无 middleware | `server.go:3050,2553`；`handlers/ui.go:62` |
+| GET | `/api/skills/serve/**`（marketplace、git、download.zip、files） | 公开，无 middleware（前缀白名单） | `handlers/skills_serving.go:132`；`middlewares.go:1134` |
+| GET | `/api/dev/pprof`、`/api/dev/pprof/goroutines` | 仅 dev mode；前缀白名单公开 | `handlers/devpprof.go:428`；`middlewares.go:1130` |
+| GET | `/api/governance/virtual-keys/quota` | 公开，无 middleware；VK header 即凭据 | `handlers/governance.go:1452` |
+| GET | `/api/oauth/per-user/flows/{id}`、`/api/oauth/per-user/flows/{id}/start` | 会话或 temp-token；不进 RBAC | `handlers/mcpsessions.go:57` |
+| GET/PUT | `/api/mcp/per-user-headers/flows/{id}` | 会话或 temp-token；不进 RBAC | `handlers/mcpheaders.go:61` |
+| GET/PUT | `/api/oauth2/consent/flows/{id}` | 会话或 temp-token；不进 RBAC | `handlers/mcpoauth2consent.go:73` |
+| POST/GET | `/mcp`、`/mcp/{slug}` | VK / MCP JWT 认证；governance 决定 | `handlers/mcpserver.go:153` |
+
+Phase 3/4 新增的认证层路由（不进 RBAC）：
+
+| 方法 | 路径 | 处理 |
+|---|---|---|
+| GET | `/api/auth/type`（或等价 `is-auth-enabled` 扩展） | 公开 |
+| GET | OIDC 登录发起与回调（Phase 3 定路径） | 公开（白名单） |
+| * | `/scim/v2/*` | `provisioningToken` Bearer 认证；全部 Users / Groups 方法均需 token；不进 RBAC（AC-SCIM-2） |
+| POST | Casdoor 桥接 webhook 端点（Phase 4 定路径） | `identity_sync.casdoor.webhook_secret` Bearer + 可选 CIDR；不进 RBAC（AC-BRIDGE-4） |
+
+### ModelProvider（`handlers/providers.go:188`）
+
+| 方法 | 路径 | 资源.操作 |
+|---|---|---|
+| GET | `/api/providers` | `ModelProvider.View`（key value 脱敏） |
+| GET | `/api/providers/{provider}` | `ModelProvider.View`（脱敏） |
+| GET | `/api/providers/{provider}/keys` | `ModelProvider.View`（脱敏） |
+| GET | `/api/providers/{provider}/keys/{key_id}` | `ModelProvider.View`；明文需 `ModelProvider.Reveal` |
+| POST | `/api/providers` | `ModelProvider.Create` |
+| POST | `/api/providers/{provider}/keys` | `ModelProvider.Create` |
+| PUT | `/api/providers/{provider}` | `ModelProvider.Update` |
+| PUT | `/api/providers/{provider}/keys/{key_id}` | `ModelProvider.Update` |
+| DELETE | `/api/providers/{provider}` | `ModelProvider.Delete` |
+| DELETE | `/api/providers/{provider}/keys/{key_id}` | `ModelProvider.Delete` |
+| POST | `/api/providers/{provider}/refresh-models` | `ModelProvider.Update` |
+| POST | `/api/providers/{provider}/keys/{key_id}/refresh-models` | `ModelProvider.Update` |
+| GET | `/api/keys` | `ModelProvider.View`（脱敏） |
+| GET | `/api/models`、`/api/models/details`、`/api/models/parameters`、`/api/models/base` | `ModelProvider.View` |
+| PUT | `/api/models/catalog` | `ModelProvider.Update` |
+
+### Settings（`handlers/config.go:121`、`webhooks.go:59`、`cache.go:38`）
+
+| 方法 | 路径 | 资源.操作 |
+|---|---|---|
+| GET | `/api/config` | `Settings.View` |
+| PUT | `/api/config` | `Settings.Update` |
+| POST | `/api/config/metadata` | `Settings.Update` |
+| GET | `/api/proxy-config` | `Settings.View` |
+| PUT | `/api/proxy-config` | `Settings.Update` |
+| POST | `/api/pricing/force-sync` | `Settings.Update` |
+| GET | `/api/webhooks`、`/api/webhooks/{id}`、`/api/webhooks/{id}/deliveries`、`/api/webhooks/deliveries` | `Settings.View` |
+| POST | `/api/webhooks` | `Settings.Update` |
+| PUT | `/api/webhooks/{id}` | `Settings.Update` |
+| DELETE | `/api/webhooks/{id}` | `Settings.Delete` |
+| POST | `/api/webhooks/{id}/rotate-secret`、`/api/webhooks/{id}/test`、`/api/webhooks/deliveries/{id}/redeliver` | `Settings.Update` |
+| DELETE | `/api/cache/clear/{cacheId}`、`/api/cache/clear-by-key/{cacheKey}` | `Settings.Delete` |
+
+`/api/dev/pprof*` 归 `Settings.View`，但由于前缀白名单它在认证层即公开，且仅 dev mode 注册；矩阵保留归属以便未来收紧。
+
+### Plugins（`handlers/plugins.go:96`）
+
+| 方法 | 路径 | 资源.操作 |
+|---|---|---|
+| GET | `/api/plugins`、`/api/plugins/builtins`、`/api/plugins/loaded`、`/api/plugins/{name}` | `Plugins.View` |
+| POST | `/api/plugins` | `Plugins.Create`（native / subprocess 加载另要求 `AuthBypassed=false`，与角色无关） |
+| PUT | `/api/plugins/{name}` | `Plugins.Update`（同上） |
+| DELETE | `/api/plugins/{name}` | `Plugins.Delete` |
+
+### MCPGateway（`handlers/mcp.go:99`、`mcpsessions.go:57`、`mcpheaders.go:61`、`mcpoauth2.go:37`、`mcpoauth2sessions.go:27`）
+
+| 方法 | 路径 | 资源.操作 |
+|---|---|---|
+| GET | `/api/mcp/clients`、`/api/mcp/library`、`/api/mcp/library/filterdata` | `MCPGateway.View` |
+| POST | `/api/mcp/library/force-sync`、`/api/mcp/library` | `MCPGateway.Update` |
+| DELETE | `/api/mcp/library/{id}` | `MCPGateway.Delete` |
+| POST | `/api/mcp/client` | `MCPGateway.Create` |
+| PUT | `/api/mcp/client/{id}` | `MCPGateway.Update` |
+| DELETE | `/api/mcp/client/{id}` | `MCPGateway.Delete` |
+| POST | `/api/mcp/client/{id}/reconnect`、`/complete-oauth`、`/initiate-verification`、`/reauthorize`、`/verify-headers`、`/verify-exchange` | `MCPGateway.Update` |
+| GET | `/api/mcp/sessions` | `MCPGateway.View` |
+| POST | `/api/mcp/sessions/{id}/reauth` | `MCPGateway.Update` |
+| DELETE | `/api/mcp/sessions/{id}` | `MCPGateway.Delete` |
+| DELETE | `/api/mcp/per-user-headers/credential/{id}` | `MCPGateway.Delete` |
+| GET | `/api/oauth/config/{id}/status` | `MCPGateway.View` |
+| DELETE | `/api/oauth/config/{id}` | `MCPGateway.Delete` |
+| GET | `/api/oauth2/sessions` | `MCPGateway.View` |
+| DELETE | `/api/oauth2/sessions/{id}` | `MCPGateway.Delete` |
+
+### VirtualMCPs（`handlers/virtualmcp.go:35`，仅 ConfigStore 存在时注册）
+
+| 方法 | 路径 | 资源.操作 |
+|---|---|---|
+| GET | `/api/mcp/virtual-mcps`、`/api/mcp/virtual-mcps/{id}` | `VirtualMCPs.View` |
+| POST | `/api/mcp/virtual-mcps` | `VirtualMCPs.Create` |
+| PUT | `/api/mcp/virtual-mcps/{id}` | `VirtualMCPs.Update` |
+| DELETE | `/api/mcp/virtual-mcps/{id}` | `VirtualMCPs.Delete` |
+| POST | `/api/mcp/virtual-mcps/{id}/virtual-keys/{vkId}` | `VirtualMCPs.Update` |
+| DELETE | `/api/mcp/virtual-mcps/{id}/virtual-keys/{vkId}` | `VirtualMCPs.Update` |
+
+### PromptRepository（`handlers/prompts.go:51`）
+
+| 方法 | 路径 | 资源.操作 |
+|---|---|---|
+| GET | `/api/prompt-repo/folders[/{id}]`、`/api/prompt-repo/prompts[/{id}]`、`/api/prompt-repo/prompts/{id}/versions`、`/api/prompt-repo/versions/{id}`、`/api/prompt-repo/prompts/{id}/sessions`、`/api/prompt-repo/sessions/{id}` | `PromptRepository.View` |
+| POST | `/api/prompt-repo/folders`、`/api/prompt-repo/prompts`、`/api/prompt-repo/prompts/{id}/versions`、`/api/prompt-repo/prompts/{id}/sessions` | `PromptRepository.Create` |
+| PUT | `/api/prompt-repo/folders/{id}`、`/api/prompt-repo/prompts/{id}`、`/api/prompt-repo/sessions/{id}`、`/api/prompt-repo/sessions/{id}/rename` | `PromptRepository.Update` |
+| POST | `/api/prompt-repo/sessions/{id}/commit` | `PromptRepository.Update` |
+| DELETE | `/api/prompt-repo/folders/{id}`、`/api/prompt-repo/prompts/{id}`、`/api/prompt-repo/versions/{id}`、`/api/prompt-repo/sessions/{id}` | `PromptRepository.Delete` |
+
+### SkillsRepository（`handlers/skills.go:76`）
+
+| 方法 | 路径 | 资源.操作 |
+|---|---|---|
+| GET | `/api/skills`、`/api/skills/{id}`、`/api/skills/{id}/versions`、`/api/skills/all/version` | `SkillsRepository.View` |
+| POST | `/api/skills`、`/api/skills/files/upload` | `SkillsRepository.Create` |
+| PUT | `/api/skills/{id}`、`/api/skills/all/version` | `SkillsRepository.Update` |
+| POST | `/api/skills/{id}/shift-version` | `SkillsRepository.Update` |
+| DELETE | `/api/skills/{id}`、`/api/skills/files/orphans` | `SkillsRepository.Delete` |
+
+`/api/skills/serve/**` 公开，见认证层表。
+
+### FeatureFlags（`handlers/featureflags.go:37`）
+
+| 方法 | 路径 | 资源.操作 |
+|---|---|---|
+| GET | `/api/feature-flags` | `FeatureFlags.View` |
+| PUT | `/api/feature-flags/{id}` | `FeatureFlags.Update` |
+
+### VirtualKeys / Teams / Customers / Governance（`handlers/governance.go:1398-1403`）
+
+| 方法 | 路径 | 资源.操作 |
+|---|---|---|
+| GET | `/api/governance/virtual-keys`、`/api/governance/virtual-keys/{vk_id}` | `VirtualKeys.View`（value 脱敏）；明文需 `VirtualKeys.Reveal` |
+| POST | `/api/governance/virtual-keys` | `VirtualKeys.Create` |
+| PUT | `/api/governance/virtual-keys/{vk_id}` | `VirtualKeys.Update` |
+| POST | `/api/governance/virtual-keys/rotate`、`/api/governance/virtual-keys/{vk_id}/rotate` | `VirtualKeys.Update`（新值只在响应中一次性返回，仍受 `Reveal` 约束：非 Admin 得脱敏值） |
+| PUT/DELETE | `/api/governance/virtual-keys/{vk_id}/budgets/{budget_id}/override` | `VirtualKeys.Update` |
+| DELETE | `/api/governance/virtual-keys/{vk_id}` | `VirtualKeys.Delete` |
+| GET | `/api/governance/teams`、`/api/governance/teams/{team_id}` | `Teams.View` |
+| POST | `/api/governance/teams` | `Teams.Create` |
+| PUT | `/api/governance/teams/{team_id}` | `Teams.Update` |
+| DELETE | `/api/governance/teams/{team_id}` | `Teams.Delete` |
+| GET | `/api/governance/customers`、`/api/governance/customers/{customer_id}` | `Customers.View` |
+| POST | `/api/governance/customers` | `Customers.Create` |
+| PUT | `/api/governance/customers/{customer_id}` | `Customers.Update` |
+| DELETE | `/api/governance/customers/{customer_id}` | `Customers.Delete` |
+| GET | `/api/governance/budgets`、`/api/governance/rate-limits` | `Governance.View` |
+| GET | `/api/governance/model-configs`、`/api/governance/model-configs/{mc_id}` | `Governance.View` |
+| POST | `/api/governance/model-configs` | `Governance.Create` |
+| PUT | `/api/governance/model-configs/{mc_id}` | `Governance.Update` |
+| DELETE | `/api/governance/model-configs/{mc_id}` | `Governance.Delete` |
+| GET | `/api/governance/providers` | `Governance.View` |
+| PUT | `/api/governance/providers/{provider_name}` | `Governance.Update` |
+| DELETE | `/api/governance/providers/{provider_name}` | `Governance.Delete` |
+| GET | `/api/governance/pricing-overrides` | `Governance.View` |
+| POST | `/api/governance/pricing-overrides` | `Governance.Create` |
+| PUT | `/api/governance/pricing-overrides/{id}` | `Governance.Update` |
+| DELETE | `/api/governance/pricing-overrides/{id}` | `Governance.Delete` |
+
+`GET /api/governance/virtual-keys/quota` 无 middleware（`governance.go:1452`），见认证层表。`GovernanceRouteOverrides` 只覆盖 Teams 五个 handler（`governance.go:229-245`），OSS 不用它承载 Users 路由。
+
+### RoutingRules（`handlers/routing.go:106`，含 legacy `/api/governance/...` 别名）
+
+| 方法 | 路径 | 资源.操作 |
+|---|---|---|
+| GET | `/api/routing/rules`、`/api/routing/rules/{rule_id}`（别名 `/api/governance/routing-rules[/{rule_id}]`） | `RoutingRules.View` |
+| POST | `/api/routing/rules`（别名同上） | `RoutingRules.Create` |
+| PUT | `/api/routing/rules/{rule_id}`（别名同上） | `RoutingRules.Update` |
+| DELETE | `/api/routing/rules/{rule_id}`（别名同上） | `RoutingRules.Delete` |
+| GET | `/api/routing/complexity-analyzer-config`（别名 `/api/governance/complexity-analyzer-config`）、`/api/routing/complexity-analyzer-status`、`/api/routing/complexity-analyzer-generations` | `RoutingRules.View` |
+| PUT | `/api/routing/complexity-analyzer-config`（别名同上） | `RoutingRules.Update` |
+| POST | `/api/routing/complexity-analyzer-config/reset`（别名同上）、`/api/routing/complexity-analyzer-status/retry` | `RoutingRules.Update` |
+| DELETE | `/api/routing/complexity-analyzer-generations/{namespace}` | `RoutingRules.Delete` |
+
+legacy 别名与 canonical 路径共用同一 handler，权限完全相同，不因路径前缀 `/api/governance` 归入 `Governance`。
+
+### Logs / MCPLogs（`handlers/logging.go:374`，仅 logging plugin 加载时注册）
+
+| 方法 | 路径 | 资源.操作 |
+|---|---|---|
+| GET | `/api/logs`、`/api/logs/{id}`、`/api/logs/sessions/{session_id}[/summary]`、`/api/logs/stats`、`/api/logs/histogram/**`、`/api/logs/dropped`、`/api/logs/filterdata`、`/api/logs/rankings[/by-dimension]`、`/api/logs/dashboard`、`/api/logs/recalculate-cost/status` | `Logs.View` |
+| GET | `/api/logs/user-agent-mappings` | `Logs.View` |
+| POST/PUT/DELETE | `/api/logs/user-agent-mappings[/{id}]` | `Logs.Delete`（Admin）—— v1 把映射维护归 Admin，避免为一组辅助表新增资源 |
+| POST | `/api/logs/recalculate-cost`、`/api/logs/recalculate-cost/cancel` | `Logs.Delete`（Admin） |
+| DELETE | `/api/logs` | `Logs.Delete` |
+| GET | 日志导出（Phase 3 若开放 CSV / JSON 导出端点） | `Logs.Download` |
+| GET | `/api/mcp-logs`、`/api/mcp-logs/{id}`、`/api/mcp-logs/stats`、`/api/mcp-logs/filterdata`、`/api/mcp-logs/histogram[/cost|/top-tools]` | `MCPLogs.View` |
+| DELETE | `/api/mcp-logs` | `MCPLogs.Delete` |
+
+v1 全 `all-data`：`Logs.View` 不做 own / team 行级过滤（PRD 范围矩阵；AC-ATTR-2 属 Phase 5）。
+
+### Users / RBAC（Phase 3 新增，`server.go` `RegisterAPIRoutes` 新 handler 族）
+
+| 方法 | 路径 | 资源.操作 |
+|---|---|---|
+| GET | `/api/governance/users`、`/api/governance/users/{id}` | `Users.View` |
+| POST | `/api/governance/users` | `Users.Create` |
+| PUT | `/api/governance/users/{id}`、`/api/governance/users/{id}/role`、`/api/governance/users/{id}/teams` | `Users.Update` |
+| DELETE | `/api/governance/users/{id}` | `Users.Delete`（永久删除并级联；禁止删自己，`users.yaml:220-225`） |
+| GET | `/api/governance/users/me`、`/api/governance/users/me/permissions` | 任何已认证会话，不做资源检查（AC-RBAC-2） |
+| GET | `/api/governance/roles`、`/api/governance/roles/{id}`、`/api/governance/permissions`、`/api/governance/resources`、`/api/governance/operations` | `RBAC.View` |
+
+`GET /api/governance/users/me/permissions` 返回（`docs/openapi/paths/management/users.yaml:272-312`、`schemas/management/users.yaml:133-144`）：
+
+```json
+{
+  "permissions": {
+    "VirtualKeys": { "View": true, "Create": false, "Update": false, "Delete": false, "Reveal": false },
+    "Logs": { "View": true, "Delete": false, "Download": false }
+  }
+}
+```
+
+有效认证模式为无认证（`AuthBypassed`）或 admin 会话时，返回全部资源全部操作为 `true`。legacy `/api/users/me/permissions`（`governancelegacy.yaml:186-192`，已标 `x-bifrost-removal: following-major-release` 且指向 successor）**不实现**；若旧脚本依赖，Phase 3 加一行 alias 即可。
+
+### Notifications / Metrics（`handlers/notifications.go:52`、`websocket.go:92`、`server.go:2523`）
+
+| 方法 | 路径 | 资源.操作 |
+|---|---|---|
+| GET | `/api/notifications` | `Notifications.View` |
+| POST | `/api/notifications` | `Notifications.Create` |
+| GET | `/ws` | `Notifications.View`（会话或 ws-ticket 认证；连接后按 AC-DEAC-6 周期重验角色） |
+| GET | `/metrics` | `Metrics.View`（telemetry 插件缺省时 404） |
+
+### 推理与 MCP 路由族（不进 RBAC）
+
+`/v1/**`、`/openai/**`、`/anthropic/**`、`/genai/**`、`/bedrock/**`、`/cohere/**`、`/litellm/**`、`/langchain/**`、`/pydanticai/**`、`/cursor/**`、`*_passthrough/**`、`/v1/async/**`、`/v1/mcp/tool/execute`、`/mcp[/{slug}]`、realtime / WebRTC 路径（`server.go:2313-2344`，`handlers/integrations.go:62`）由 `InferenceMiddleware` 放行、governance 插件按 VK / user permit 决定（见 `auth-and-credentials` 的请求凭据矩阵，AC-AUTH-7 至 AC-AUTH-12）。`Inference` enum 值保留不用。
+
+## 保留、v1 无路由
+
+以下 `RbacResource` 值在 OSS 没有对应路由，v1 seed 不为它们生成任何权限行；UI 门控对它们恒 false。
+
+| 资源 | 原因 |
+|---|---|
+| `GuardrailsConfig`、`GuardrailsProviders`、`GuardrailRules` | 企业 guardrails |
+| `UserProvisioning` | Phase 4 配置向导为 Should；向导落地前 `scim_config` / `identity_sync` 只从文件读取，无路由 |
+| `Cluster` | `cluster_config` 企业；v1 单实例 |
+| `Observability` | 企业 |
+| `Dashboard` | 无独立路由；dashboard 聚合走 `Logs.View` |
+| `MCPToolGroups` | 企业 |
+| `AdaptiveRouter` | 企业 |
+| `AuditLogs` | Phase 6 |
+| `PromptDeploymentStrategy` | 企业 |
+| `AccessProfiles` | Phase 6 |
+| `Projects` | 企业 |
+| `APIKeys` | 企业 |
+| `Inference` | 推理路由不进 RBAC |
+| `CircuitBreaker` | 企业 |
+| `Devices`、`Inventory`、`EdgeConfig` | 企业 edge |
+
+## 与验收的对应
+
+| 契约 | AC |
+|---|---|
+| 矩阵每一行：非授权角色 → 403；Admin 通过 | AC-RBAC-1 |
+| `/api/governance/users/me/permissions` 形状与 seed 一致 | AC-RBAC-2 |
+| Viewer 无 Create / Update / Delete / Reveal / Download | AC-RBAC-3 |
+| `Reveal` 仅 Admin；非 Admin `View` 得脱敏值 | AC-RBAC-4、AC-AUTH-13 |
+| Phase 3 seed 逐行比对本页 | AC-RBAC-5 |
+| 普通 SSO user 会话不是 `IsLocalAdmin`，Viewer 写接口 403 | AC-SESS-1 |
+| `/ws` 周期重验 | AC-DEAC-6 |
