@@ -6345,6 +6345,9 @@ func executeRequestWithRetries[T any](
 							Type:    &errType,
 							Message: err.Error(),
 						},
+						ExtraFields: schemas.BifrostErrorExtraFields{
+							ErrorType: schemas.ErrorTypeProviderCredentialsExhausted,
+						},
 					}
 				}
 				return zero, newBifrostErrorFromMsg(err.Error())
@@ -6992,6 +6995,13 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 		} else {
 			req.Context.ClearValue(schemas.BifrostContextKeyDoesNotSendDoneMarker)
 		}
+		// Same set-or-clear discipline: wait_for_usage must never leak onto a fallback provider
+		// that did not declare it, or that provider's stream would hold past finish_reason.
+		if config.CustomProviderConfig != nil && config.CustomProviderConfig.WaitForUsage {
+			req.Context.SetValue(schemas.BifrostContextKeyWaitForUsage, true)
+		} else {
+			req.Context.ClearValue(schemas.BifrostContextKeyWaitForUsage)
+		}
 
 		bifrost.endCoreSpan(workerSetupSpan)
 
@@ -7091,15 +7101,19 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 						bifrost.logger.Debug("error building key pool for model %s: %v", model, keyPoolErr)
 						bifrost.sendWorkerError(req, schemas.BifrostError{
 							IsBifrostError: false,
+							Type:           schemas.Ptr(schemas.NoKeySupportsModel),
+							StatusCode:     schemas.Ptr(400),
 							Error: &schemas.ErrorField{
 								Message: keyPoolErr.Error(),
 								Error:   keyPoolErr,
+								Type:    schemas.Ptr(schemas.NoKeySupportsModel),
 							},
 							ExtraFields: schemas.BifrostErrorExtraFields{
 								Provider:               provider.GetProviderKey(),
 								RequestType:            req.RequestType,
 								OriginalModelRequested: model,
 								ResolvedModelUsed:      model,
+								ErrorType:              schemas.ErrorTypeCallerModelNotAvailable,
 							},
 						})
 						continue
@@ -7557,8 +7571,8 @@ func promptCacheResponsesRequest(ctx *schemas.BifrostContext, config *schemas.Pr
 }
 
 // prepareResponsesRequest returns the Responses request to dispatch for one attempt:
-// prompt-cache breakpoints first, then namespace tools flattened when the target wire
-// does not understand them (#7048). Both steps are copy-on-write, so the shared
+// prompt-cache breakpoints first, then embedded client tools promoted and namespace
+// tools flattened when the target wire does not understand them. All steps are copy-on-write, so the shared
 // req.BifrostRequest keeps the caller's namespaces for a later fallback attempt against
 // a wire that does.
 //
@@ -7571,18 +7585,25 @@ func prepareResponsesRequest(ctx *schemas.BifrostContext, config *schemas.Provid
 	if r == nil {
 		return nil, nil
 	}
+	var supported bool
+	if capable, ok := provider.(schemas.ResponsesNamespaceToolProvider); ok {
+		supported = capable.SupportsResponsesNamespaceTools(ctx, key, r.Model)
+	} else {
+		supported = providerUtils.ResponsesNamespaceToolsSupported(ctx, schemas.ResolveBaseProvider(ctx, provider.GetProviderKey()), r.Model)
+	}
+	if !supported {
+		var bifrostErr *schemas.BifrostError
+		r, bifrostErr = hoistResponsesAdditionalTools(r)
+		if bifrostErr != nil {
+			return nil, bifrostErr
+		}
+	}
 	// Codex's explicit "functions" namespace is the default namespace by definition,
 	// so it is unwrapped for every wire before the support check: Bedrock Mantle
 	// reserves the name, and flattening wires would otherwise prefix its members.
 	r, bifrostErr := providerUtils.UnwrapDefaultNamespaceTools(r)
 	if bifrostErr != nil {
 		return nil, bifrostErr
-	}
-	var supported bool
-	if capable, ok := provider.(schemas.ResponsesNamespaceToolProvider); ok {
-		supported = capable.SupportsResponsesNamespaceTools(ctx, key, r.Model)
-	} else {
-		supported = providerUtils.ResponsesNamespaceToolsSupported(ctx, schemas.ResolveBaseProvider(ctx, provider.GetProviderKey()), r.Model)
 	}
 	if supported {
 		// Pass-through: the request carries no alias map, so nothing is restored.
@@ -9098,7 +9119,7 @@ func (bifrost *Bifrost) getKeysForBatchAndFileOps(ctx *schemas.BifrostContext, p
 		//   - If key.Models is non-empty → only include if model is in list
 		// Blacklist wins over allowlist
 		if model != nil && *model != "" {
-			if !k.ModelAccess().Allows(string(providerKey), *model) {
+			if k.BlacklistedModels.IsBlocked(*model) || !k.Models.IsAllowed(*model) {
 				continue
 			}
 		}
@@ -9215,10 +9236,11 @@ func (bifrost *Bifrost) selectKeyFromProviderForModelWithPool(ctx *schemas.Bifro
 			// NOTE: Model filtering uses the original requested model (which may be an alias).
 			// key.Models and key.BlacklistedModels must therefore be expressed in alias keys.
 			// The provider-specific identifier is resolved later in the handler closure via key.Aliases.Resolve(model).
-			modelSupported := hasValue && key.ModelAccess().Allows(string(providerKey), model)
+			// vLLM also resolves a per-key copy below because ModelName contains the identifier served by that key.
+			modelSupported := hasValue && key.Models.IsAllowed(model) && !key.BlacklistedModels.IsBlocked(model)
 			if baseProviderType == schemas.VLLM && key.VLLMKeyConfig != nil {
 				if key.VLLMKeyConfig.ModelName != "" {
-					modelSupported = modelSupported && (key.VLLMKeyConfig.ModelName == model)
+					modelSupported = modelSupported && (key.VLLMKeyConfig.ModelName == key.Aliases.Resolve(model))
 				}
 			}
 			if modelSupported {
